@@ -428,7 +428,7 @@ impl Options {
                     ))
                     .emit();
                 }
-                themes.push(StylePath { path: theme_file });
+                themes.push(StylePath { path: theme_file, is_additional_theme: true });
             }
         }
 

@@ -52,6 +52,7 @@ pub fn render<T: Print, S: Print>(
     <link rel=\"stylesheet\" type=\"text/css\" href=\"{static_root_path}normalize{suffix}.css\">\
     <link rel=\"stylesheet\" type=\"text/css\" href=\"{static_root_path}rustdoc{suffix}.css\">\
     {style_files}\
+    {additional_themes}\
     <script src=\"{static_root_path}storage{suffix}.js\"></script>\
     <noscript><link rel=\"stylesheet\" href=\"{static_root_path}noscript{suffix}.css\"></noscript>\
     {css_extension}\
@@ -171,10 +172,27 @@ pub fn render<T: Print, S: Print>(
         krate = layout.krate,
         style_files = style_files
             .iter()
+            .filter(|t| !t.is_additional_theme)
             .filter_map(|t| t.path.file_stem())
             .filter_map(|t| t.to_str())
             .map(|t| format!(
                 r#"<link rel="stylesheet" type="text/css" href="{}.css">"#,
+                Escape(&format!("{}{}{}", static_root_path, t, page.resource_suffix)),
+            ))
+            .collect::<String>(),
+        additional_themes = style_files
+            .iter()
+            .filter(|t| t.is_additional_theme)
+            .filter_map(|t| t.path.file_stem())
+            .filter_map(|t| t.to_str())
+            .map(|t| format!(
+                r##"<script>
+    var link = document.createElement("link");
+    link.href = "{}.css"
+    link.type = "text/css";
+    link.rel = "stylesheet";
+    document.getElementsByTagName("head")[0].appendChild(link);
+</script>"##,
                 Escape(&format!("{}{}{}", static_root_path, t, page.resource_suffix)),
             ))
             .collect::<String>(),

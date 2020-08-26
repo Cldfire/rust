@@ -344,6 +344,10 @@ impl Serialize for TypeWithKind {
 pub struct StylePath {
     /// The path to the theme
     pub path: PathBuf,
+    /// Whether or not this style should be treated as an additional theme
+    ///
+    /// Additional themes are loaded only when JS is enabled in the browser.
+    pub is_additional_theme: bool,
 }
 
 thread_local!(pub static CURRENT_DEPTH: Cell<usize> = Cell::new(0));
@@ -470,9 +474,9 @@ impl FormatRenderer for Context {
         //
         // Note that these must be added before `sources::render` is called
         // so that the resulting source pages are styled
-        scx.style_files.push(StylePath { path: PathBuf::from("light.css") });
-        scx.style_files.push(StylePath { path: PathBuf::from("dark.css") });
-        scx.style_files.push(StylePath { path: PathBuf::from("ayu.css") });
+        scx.style_files.push(StylePath { path: PathBuf::from("light.css"), is_additional_theme: false });
+        scx.style_files.push(StylePath { path: PathBuf::from("dark.css"), is_additional_theme: true });
+        scx.style_files.push(StylePath { path: PathBuf::from("ayu.css"), is_additional_theme: true });
 
         let dst = output;
         scx.ensure_dir(&dst)?;
@@ -561,7 +565,7 @@ impl FormatRenderer for Context {
 
         let mut style_files = self.shared.style_files.clone();
         let sidebar = "<p class='location'>Settings</p><div class='sidebar-elems'></div>";
-        style_files.push(StylePath { path: PathBuf::from("settings.css") });
+        style_files.push(StylePath { path: PathBuf::from("settings.css"), is_additional_theme: false });
         let v = layout::render(
             &self.shared.layout,
             &page,
