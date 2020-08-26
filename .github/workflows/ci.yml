@@ -364,9 +364,6 @@ jobs:
           - name: x86_64-gnu-distcheck
             os: ubuntu-latest-xl
             env: {}
-          - name: x86_64-gnu-full-bootstrap
-            os: ubuntu-latest-xl
-            env: {}
           - name: x86_64-gnu-llvm-8
             env:
               RUST_BACKTRACE: 1
@@ -575,8 +572,14 @@ jobs:
       CACHE_DOMAIN: ci-caches-gha.rust-lang.org
     if: "github.event_name == 'push' && github.ref == 'refs/heads/auto' && github.repository == 'rust-lang-ci/rust'"
     strategy:
+      fail-fast: false
       matrix:
         include:
+          - name: aarch64-gnu
+            os:
+              - self-hosted
+              - ARM64
+              - linux
           - name: dist-x86_64-apple
             env:
               SCRIPT: "./x.py dist"

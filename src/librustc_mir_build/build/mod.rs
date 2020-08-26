@@ -6,11 +6,10 @@ use rustc_attr::{self as attr, UnwindAttr};
 use rustc_errors::ErrorReported;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::lang_items;
+use rustc_hir::lang_items::LangItem;
 use rustc_hir::{GeneratorKind, HirIdMap, Node};
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::region;
 use rustc_middle::mir::*;
 use rustc_middle::ty::subst::Subst;
@@ -35,25 +34,32 @@ crate fn mir_built<'tcx>(
 
 /// Construct the MIR for a given `DefId`.
 fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_> {
-    let id = tcx.hir().as_local_hir_id(def.did);
+    let id = tcx.hir().local_def_id_to_hir_id(def.did);
 
     // Figure out what primary body this item has.
-    let (body_id, return_ty_span) = match tcx.hir().get(id) {
+    let (body_id, return_ty_span, span_with_body) = match tcx.hir().get(id) {
         Node::Expr(hir::Expr { kind: hir::ExprKind::Closure(_, decl, body_id, _, _), .. }) => {
-            (*body_id, decl.output.span())
+            (*body_id, decl.output.span(), None)
         }
         Node::Item(hir::Item {
             kind: hir::ItemKind::Fn(hir::FnSig { decl, .. }, _, body_id),
+            span,
             ..
         })
         | Node::ImplItem(hir::ImplItem {
             kind: hir::ImplItemKind::Fn(hir::FnSig { decl, .. }, body_id),
+            span,
             ..
         })
         | Node::TraitItem(hir::TraitItem {
             kind: hir::TraitItemKind::Fn(hir::FnSig { decl, .. }, hir::TraitFn::Provided(body_id)),
+            span,
             ..
-        }) => (*body_id, decl.output.span()),
+        }) => {
+            // Use the `Span` of the `Item/ImplItem/TraitItem` as the body span,
+            // since the def span of a function does not include the body
+            (*body_id, decl.output.span(), Some(*span))
+        }
         Node::Item(hir::Item {
             kind: hir::ItemKind::Static(ty, _, body_id) | hir::ItemKind::Const(ty, body_id),
             ..
@@ -62,11 +68,15 @@ fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_
         | Node::TraitItem(hir::TraitItem {
             kind: hir::TraitItemKind::Const(ty, Some(body_id)),
             ..
-        }) => (*body_id, ty.span),
-        Node::AnonConst(hir::AnonConst { body, hir_id, .. }) => (*body, tcx.hir().span(*hir_id)),
+        }) => (*body_id, ty.span, None),
+        Node::AnonConst(hir::AnonConst { body, hir_id, .. }) => (*body, tcx.hir().span(*hir_id), None),
 
         _ => span_bug!(tcx.hir().span(id), "can't build MIR for {:?}", def.did),
     };
+
+    // If we don't have a specialized span for the body, just use the
+    // normal def span.
+    let span_with_body = span_with_body.unwrap_or_else(|| tcx.hir().span(id));
 
     tcx.infer_ctxt().enter(|infcx| {
         let cx = Cx::new(&infcx, def, id);
@@ -135,8 +145,7 @@ fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_
                 // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
                 // (as it's created inside the body itself, not passed in from outside).
                 let ty = if fn_sig.c_variadic && index == fn_sig.inputs().len() {
-                    let va_list_did =
-                        tcx.require_lang_item(lang_items::VaListTypeLangItem, Some(arg.span));
+                    let va_list_did = tcx.require_lang_item(LangItem::VaList, Some(arg.span));
 
                     tcx.type_of(va_list_did).subst(tcx, &[tcx.lifetimes.re_erased.into()])
                 } else {
@@ -168,6 +177,7 @@ fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_
                 return_ty,
                 return_ty_span,
                 body,
+                span_with_body
             );
             mir.yield_ty = yield_ty;
             mir
@@ -537,7 +547,7 @@ macro_rules! unpack {
 fn should_abort_on_panic(tcx: TyCtxt<'_>, fn_def_id: LocalDefId, _abi: Abi) -> bool {
     // Validate `#[unwind]` syntax regardless of platform-specific panic strategy.
     let attrs = &tcx.get_attrs(fn_def_id.to_def_id());
-    let unwind_attr = attr::find_unwind_attr(Some(tcx.sess.diagnostic()), attrs);
+    let unwind_attr = attr::find_unwind_attr(&tcx.sess, attrs);
 
     // We never unwind, so it's not relevant to stop an unwind.
     if tcx.sess.panic_strategy() != PanicStrategy::Unwind {
@@ -572,6 +582,7 @@ fn construct_fn<'a, 'tcx, A>(
     return_ty: Ty<'tcx>,
     return_ty_span: Span,
     body: &'tcx hir::Body<'tcx>,
+    span_with_body: Span
 ) -> Body<'tcx>
 where
     A: Iterator<Item = ArgInfo<'tcx>>,
@@ -586,7 +597,7 @@ where
 
     let mut builder = Builder::new(
         hir,
-        span,
+        span_with_body,
         arguments.len(),
         safety,
         return_ty,
@@ -629,7 +640,7 @@ where
                 )
             );
             // Attribute epilogue to function's closing brace
-            let fn_end = span.shrink_to_hi();
+            let fn_end = span_with_body.shrink_to_hi();
             let source_info = builder.source_info(fn_end);
             let return_block = builder.return_block();
             builder.cfg.goto(block, source_info, return_block);
@@ -798,21 +809,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         argument_scope: region::Scope,
         ast_body: &'tcx hir::Expr<'tcx>,
     ) -> BlockAnd<()> {
-        let tcx = self.hir.tcx();
-        let attrs = tcx.codegen_fn_attrs(fn_def_id);
-        let naked = attrs.flags.contains(CodegenFnAttrFlags::NAKED);
-
         // Allocate locals for the function arguments
         for &ArgInfo(ty, _, arg_opt, _) in arguments.iter() {
             let source_info =
                 SourceInfo::outermost(arg_opt.map_or(self.fn_span, |arg| arg.pat.span));
             let arg_local = self.local_decls.push(LocalDecl::with_source_info(ty, source_info));
-
-            // Emit function argument debuginfo only for non-naked functions.
-            // See: https://github.com/rust-lang/rust/issues/42779
-            if naked {
-                continue;
-            }
 
             // If this is a simple binding pattern, give debuginfo a nice name.
             if let Some(arg) = arg_opt {
@@ -826,6 +827,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
         }
 
+        let tcx = self.hir.tcx();
         let tcx_hir = tcx.hir();
         let hir_typeck_results = self.hir.typeck_results();
 

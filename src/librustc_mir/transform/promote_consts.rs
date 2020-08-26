@@ -12,7 +12,7 @@
 //! initialization and can otherwise silence errors, if
 //! move analysis runs after promotion on broken MIR.
 
-use rustc_ast::ast::LitKind;
+use rustc_ast::LitKind;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::traversal::ReversePostorder;
@@ -101,7 +101,7 @@ impl TempState {
 /// of a larger candidate.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Candidate {
-    /// Borrow of a constant temporary.
+    /// Borrow of a constant temporary, candidate for lifetime extension.
     Ref(Location),
 
     /// Promotion of the `x` in `[x; 32]`.
@@ -130,7 +130,7 @@ impl Candidate {
 
 fn args_required_const(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Vec<usize>> {
     let attrs = tcx.get_attrs(def_id);
-    let attr = attrs.iter().find(|a| a.check_name(sym::rustc_args_required_const))?;
+    let attr = attrs.iter().find(|a| tcx.sess.check_name(a, sym::rustc_args_required_const))?;
     let mut ret = vec![];
     for meta in attr.meta_item_list()? {
         match meta.literal()?.kind {
@@ -524,7 +524,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                                         // The `is_empty` predicate is introduced to exclude the case
                                         // where the projection operations are [ .field, * ].
                                         // The reason is because promotion will be illegal if field
-                                        // accesses preceed the dereferencing.
+                                        // accesses precede the dereferencing.
                                         // Discussion can be found at
                                         // https://github.com/rust-lang/rust/pull/74945#discussion_r463063247
                                         // There may be opportunity for generalization, but this needs to be

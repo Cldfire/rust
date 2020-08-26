@@ -8,12 +8,12 @@
 use RibKind::*;
 
 use crate::{path_names_to_string, BindingError, CrateLint, LexicalScopeBinding};
-use crate::{Module, ModuleOrUniformRoot, NameBindingKind, ParentScope, PathResult};
+use crate::{Module, ModuleOrUniformRoot, ParentScope, PathResult};
 use crate::{ResolutionError, Resolver, Segment, UseError};
 
-use rustc_ast::ast::*;
 use rustc_ast::ptr::P;
 use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
+use rustc_ast::*;
 use rustc_ast::{unwrap_or, walk_list};
 use rustc_ast_lowering::ResolverAstLowering;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -24,15 +24,14 @@ use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX};
 use rustc_hir::TraitCandidate;
 use rustc_middle::{bug, span_bug};
 use rustc_session::lint;
-use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
 use smallvec::{smallvec, SmallVec};
 
-use log::debug;
 use rustc_span::source_map::{respan, Spanned};
 use std::collections::BTreeSet;
 use std::mem::{replace, take};
+use tracing::debug;
 
 mod diagnostics;
 crate mod lifetimes;
@@ -111,7 +110,7 @@ crate enum RibKind<'a> {
     ItemRibKind(HasGenericParams),
 
     /// We're in a constant item. Can't refer to dynamic stuff.
-    ConstantItemRibKind,
+    ConstantItemRibKind(bool),
 
     /// We passed through a module.
     ModuleRibKind(Module<'a>),
@@ -137,7 +136,7 @@ impl RibKind<'_> {
             NormalRibKind
             | ClosureOrAsyncRibKind
             | FnItemRibKind
-            | ConstantItemRibKind
+            | ConstantItemRibKind(_)
             | ModuleRibKind(_)
             | MacroDefinition(_)
             | ConstParamTyRibKind => false,
@@ -226,7 +225,7 @@ impl<'a> PathSource<'a> {
                 ValueNS => "method or associated constant",
                 MacroNS => bug!("associated macro"),
             },
-            PathSource::Expr(parent) => match &parent.as_ref().map(|p| &p.kind) {
+            PathSource::Expr(parent) => match parent.as_ref().map(|p| &p.kind) {
                 // "function" here means "anything callable" rather than `DefKind::Fn`,
                 // this is not precise but usually more helpful than just "value".
                 Some(ExprKind::Call(call_expr, _)) => match &call_expr.kind {
@@ -426,7 +425,7 @@ impl<'a, 'ast> Visitor<'ast> for LateResolutionVisitor<'a, '_, 'ast> {
     }
     fn visit_anon_const(&mut self, constant: &'ast AnonConst) {
         debug!("visit_anon_const {:?}", constant);
-        self.with_constant_rib(|this| {
+        self.with_constant_rib(constant.value.is_potential_trivial_const_param(), |this| {
             visit::walk_anon_const(this, constant);
         });
     }
@@ -628,7 +627,7 @@ impl<'a, 'ast> Visitor<'ast> for LateResolutionVisitor<'a, '_, 'ast> {
                         if !check_ns(TypeNS) && check_ns(ValueNS) {
                             // This must be equivalent to `visit_anon_const`, but we cannot call it
                             // directly due to visitor lifetimes so we have to copy-paste some code.
-                            self.with_constant_rib(|this| {
+                            self.with_constant_rib(true, |this| {
                                 this.smart_resolve_path(
                                     ty.id,
                                     qself.as_ref(),
@@ -829,7 +828,7 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
                 | ClosureOrAsyncRibKind
                 | FnItemRibKind
                 | ItemRibKind(..)
-                | ConstantItemRibKind
+                | ConstantItemRibKind(_)
                 | ModuleRibKind(..)
                 | ForwardTyParamBanRibKind
                 | ConstParamTyRibKind => {
@@ -948,7 +947,14 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
                                         // Only impose the restrictions of `ConstRibKind` for an
                                         // actual constant expression in a provided default.
                                         if let Some(expr) = default {
-                                            this.with_constant_rib(|this| this.visit_expr(expr));
+                                            // We allow arbitrary const expressions inside of associated consts,
+                                            // even if they are potentially not const evaluatable.
+                                            //
+                                            // Type parameters can already be used and as associated consts are
+                                            // not used as part of the type system, this is far less surprising.
+                                            this.with_constant_rib(true, |this| {
+                                                this.visit_expr(expr)
+                                            });
                                         }
                                     }
                                     AssocItemKind::Fn(_, _, generics, _) => {
@@ -989,7 +995,9 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
                 self.with_item_rib(HasGenericParams::No, |this| {
                     this.visit_ty(ty);
                     if let Some(expr) = expr {
-                        this.with_constant_rib(|this| this.visit_expr(expr));
+                        this.with_constant_rib(expr.is_potential_trivial_const_param(), |this| {
+                            this.visit_expr(expr)
+                        });
                     }
                 });
             }
@@ -1086,11 +1094,11 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
         self.with_rib(ValueNS, kind, |this| this.with_rib(TypeNS, kind, f))
     }
 
-    fn with_constant_rib(&mut self, f: impl FnOnce(&mut Self)) {
+    fn with_constant_rib(&mut self, trivial: bool, f: impl FnOnce(&mut Self)) {
         debug!("with_constant_rib");
-        self.with_rib(ValueNS, ConstantItemRibKind, |this| {
-            this.with_rib(TypeNS, ConstantItemRibKind, |this| {
-                this.with_label_rib(ConstantItemRibKind, f);
+        self.with_rib(ValueNS, ConstantItemRibKind(trivial), |this| {
+            this.with_rib(TypeNS, ConstantItemRibKind(trivial), |this| {
+                this.with_label_rib(ConstantItemRibKind(trivial), f);
             })
         });
     }
@@ -1220,7 +1228,7 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
                                 for item in impl_items {
                                     use crate::ResolutionError::*;
                                     match &item.kind {
-                                        AssocItemKind::Const(..) => {
+                                        AssocItemKind::Const(_default, _ty, _expr) => {
                                             debug!("resolve_implementation AssocItemKind::Const",);
                                             // If this is a trait impl, ensure the const
                                             // exists in trait
@@ -1231,7 +1239,12 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
                                                 |n, s| ConstNotMemberOfTrait(n, s),
                                             );
 
-                                            this.with_constant_rib(|this| {
+                                            // We allow arbitrary const expressions inside of associated consts,
+                                            // even if they are potentially not const evaluatable.
+                                            //
+                                            // Type parameters can already be used and as associated consts are
+                                            // not used as part of the type system, this is far less surprising.
+                                            this.with_constant_rib(true, |this| {
                                                 visit::walk_assoc_item(this, item, AssocCtxt::Impl)
                                             });
                                         }
@@ -1510,30 +1523,18 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
         pat_src: PatternSource,
         bindings: &mut SmallVec<[(PatBoundCtx, FxHashSet<Ident>); 1]>,
     ) {
-        let is_tuple_struct_pat = matches!(pat.kind, PatKind::TupleStruct(_, _));
-
         // Visit all direct subpatterns of this pattern.
         pat.walk(&mut |pat| {
             debug!("resolve_pattern pat={:?} node={:?}", pat, pat.kind);
             match pat.kind {
                 PatKind::Ident(bmode, ident, ref sub) => {
-                    if is_tuple_struct_pat && sub.as_ref().filter(|p| p.is_rest()).is_some() {
-                        // In tuple struct patterns ignore the invalid `ident @ ...`.
-                        // It will be handled as an error by the AST lowering.
-                        self.r
-                            .session
-                            .delay_span_bug(ident.span, "ident in tuple pattern is invalid");
-                    } else {
-                        // First try to resolve the identifier as some existing entity,
-                        // then fall back to a fresh binding.
-                        let has_sub = sub.is_some();
-                        let res = self
-                            .try_resolve_as_non_binding(pat_src, pat, bmode, ident, has_sub)
-                            .unwrap_or_else(|| {
-                                self.fresh_binding(ident, pat.id, pat_src, bindings)
-                            });
-                        self.r.record_partial_res(pat.id, PartialRes::new(res));
-                    }
+                    // First try to resolve the identifier as some existing entity,
+                    // then fall back to a fresh binding.
+                    let has_sub = sub.is_some();
+                    let res = self
+                        .try_resolve_as_non_binding(pat_src, pat, bmode, ident, has_sub)
+                        .unwrap_or_else(|| self.fresh_binding(ident, pat.id, pat_src, bindings));
+                    self.r.record_partial_res(pat.id, PartialRes::new(res));
                 }
                 PatKind::TupleStruct(ref path, ..) => {
                     self.smart_resolve_path(pat.id, None, path, PathSource::TupleStruct(pat.span));
@@ -1730,7 +1731,12 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
         source: PathSource<'ast>,
         crate_lint: CrateLint,
     ) -> PartialRes {
-        log::debug!("smart_resolve_path_fragment(id={:?},qself={:?},path={:?}", id, qself, path);
+        tracing::debug!(
+            "smart_resolve_path_fragment(id={:?},qself={:?},path={:?}",
+            id,
+            qself,
+            path
+        );
         let ns = source.namespace();
         let is_expected = &|res| source.is_expected(res);
 
@@ -2335,94 +2341,30 @@ impl<'a, 'b, 'ast> LateResolutionVisitor<'a, 'b, 'ast> {
         ident.span = ident.span.normalize_to_macros_2_0();
         let mut search_module = self.parent_scope.module;
         loop {
-            self.get_traits_in_module_containing_item(ident, ns, search_module, &mut found_traits);
+            self.r.get_traits_in_module_containing_item(
+                ident,
+                ns,
+                search_module,
+                &mut found_traits,
+                &self.parent_scope,
+            );
             search_module =
                 unwrap_or!(self.r.hygienic_lexical_parent(search_module, &mut ident.span), break);
         }
 
         if let Some(prelude) = self.r.prelude {
             if !search_module.no_implicit_prelude {
-                self.get_traits_in_module_containing_item(ident, ns, prelude, &mut found_traits);
+                self.r.get_traits_in_module_containing_item(
+                    ident,
+                    ns,
+                    prelude,
+                    &mut found_traits,
+                    &self.parent_scope,
+                );
             }
         }
 
         found_traits
-    }
-
-    fn get_traits_in_module_containing_item(
-        &mut self,
-        ident: Ident,
-        ns: Namespace,
-        module: Module<'a>,
-        found_traits: &mut Vec<TraitCandidate>,
-    ) {
-        assert!(ns == TypeNS || ns == ValueNS);
-        let mut traits = module.traits.borrow_mut();
-        if traits.is_none() {
-            let mut collected_traits = Vec::new();
-            module.for_each_child(self.r, |_, name, ns, binding| {
-                if ns != TypeNS {
-                    return;
-                }
-                match binding.res() {
-                    Res::Def(DefKind::Trait | DefKind::TraitAlias, _) => {
-                        collected_traits.push((name, binding))
-                    }
-                    _ => (),
-                }
-            });
-            *traits = Some(collected_traits.into_boxed_slice());
-        }
-
-        for &(trait_name, binding) in traits.as_ref().unwrap().iter() {
-            // Traits have pseudo-modules that can be used to search for the given ident.
-            if let Some(module) = binding.module() {
-                let mut ident = ident;
-                if ident.span.glob_adjust(module.expansion, binding.span).is_none() {
-                    continue;
-                }
-                if self
-                    .r
-                    .resolve_ident_in_module_unadjusted(
-                        ModuleOrUniformRoot::Module(module),
-                        ident,
-                        ns,
-                        &self.parent_scope,
-                        false,
-                        module.span,
-                    )
-                    .is_ok()
-                {
-                    let import_ids = self.find_transitive_imports(&binding.kind, trait_name);
-                    let trait_def_id = module.def_id().unwrap();
-                    found_traits.push(TraitCandidate { def_id: trait_def_id, import_ids });
-                }
-            } else if let Res::Def(DefKind::TraitAlias, _) = binding.res() {
-                // For now, just treat all trait aliases as possible candidates, since we don't
-                // know if the ident is somewhere in the transitive bounds.
-                let import_ids = self.find_transitive_imports(&binding.kind, trait_name);
-                let trait_def_id = binding.res().def_id();
-                found_traits.push(TraitCandidate { def_id: trait_def_id, import_ids });
-            } else {
-                bug!("candidate is not trait or trait alias?")
-            }
-        }
-    }
-
-    fn find_transitive_imports(
-        &mut self,
-        mut kind: &NameBindingKind<'_>,
-        trait_name: Ident,
-    ) -> SmallVec<[LocalDefId; 1]> {
-        let mut import_ids = smallvec![];
-        while let NameBindingKind::Import { import, binding, .. } = kind {
-            let id = self.r.local_def_id(import.id);
-            self.r.maybe_unused_trait_imports.insert(id);
-            self.r.add_to_glob_map(&import, trait_name);
-            import_ids.push(id);
-            kind = &binding.kind;
-        }
-        import_ids
     }
 }
 

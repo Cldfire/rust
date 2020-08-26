@@ -8,7 +8,7 @@ pub(crate) use self::check_match::check_match;
 
 use crate::thir::util::UserAnnotatedTyHelpers;
 
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
@@ -133,7 +133,7 @@ crate enum PatKind<'tcx> {
         var: hir::HirId,
         ty: Ty<'tcx>,
         subpattern: Option<Pat<'tcx>>,
-        /// Is this the leftmost occurance of the binding, i.e., is `var` the
+        /// Is this the leftmost occurrence of the binding, i.e., is `var` the
         /// `HirId` of this pattern?
         is_primary: bool,
     },

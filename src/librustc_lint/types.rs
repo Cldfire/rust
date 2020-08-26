@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use crate::{LateContext, LateLintPass, LintContext};
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
@@ -19,8 +19,8 @@ use rustc_target::abi::Abi;
 use rustc_target::abi::{Integer, LayoutOf, TagEncoding, VariantIdx, Variants};
 use rustc_target::spec::abi::Abi as SpecAbi;
 
-use log::debug;
 use std::cmp;
+use tracing::debug;
 
 declare_lint! {
     UNUSED_COMPARISONS,
@@ -195,8 +195,8 @@ fn report_bin_hex_error(
 //
 // No suggestion for: `isize`, `usize`.
 fn get_type_suggestion(t: Ty<'_>, val: u128, negative: bool) -> Option<&'static str> {
-    use rustc_ast::ast::IntTy::*;
-    use rustc_ast::ast::UintTy::*;
+    use rustc_ast::IntTy::*;
+    use rustc_ast::UintTy::*;
     macro_rules! find_fit {
         ($ty:expr, $val:expr, $negative:expr,
          $($type:ident => [$($utypes:expr),*] => [$($itypes:expr),*]),+) => {
@@ -258,7 +258,7 @@ fn lint_int_literal<'tcx>(
         let par_id = cx.tcx.hir().get_parent_node(e.hir_id);
         if let Node::Expr(par_e) = cx.tcx.hir().get(par_id) {
             if let hir::ExprKind::Struct(..) = par_e.kind {
-                if is_range_literal(cx.sess().source_map(), par_e)
+                if is_range_literal(par_e)
                     && lint_overflowing_range_endpoint(cx, lit, v, max, e, par_e, t.name_str())
                 {
                     // The overflowing literal lint was overridden.
@@ -317,7 +317,7 @@ fn lint_uint_literal<'tcx>(
                         return;
                     }
                 }
-                hir::ExprKind::Struct(..) if is_range_literal(cx.sess().source_map(), par_e) => {
+                hir::ExprKind::Struct(..) if is_range_literal(par_e) => {
                     let t = t.name_str();
                     if lint_overflowing_range_endpoint(cx, lit, lit_val, max, e, par_e, t) {
                         // The overflowing literal lint was overridden.
@@ -538,7 +538,7 @@ fn ty_is_known_nonnull<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, mode: CItemKi
             let guaranteed_nonnull_optimization = tcx
                 .get_attrs(def.did)
                 .iter()
-                .any(|a| a.check_name(sym::rustc_nonnull_optimization_guaranteed));
+                .any(|a| tcx.sess.check_name(a, sym::rustc_nonnull_optimization_guaranteed));
 
             if guaranteed_nonnull_optimization {
                 return true;
@@ -556,6 +556,7 @@ fn ty_is_known_nonnull<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, mode: CItemKi
         _ => false,
     }
 }
+
 /// Given a non-null scalar (or transparent) type `ty`, return the nullable version of that type.
 /// If the type passed in was not scalar, returns None.
 fn get_nullable_type<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
@@ -1074,7 +1075,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
             }
             // If `ty` is a `repr(transparent)` newtype, and the non-zero-sized type is a generic
             // argument, which after substitution, is `()`, then this branch can be hit.
-            FfiResult::FfiUnsafe { ty, .. } if is_return_type && ty.is_unit() => return,
+            FfiResult::FfiUnsafe { ty, .. } if is_return_type && ty.is_unit() => {}
             FfiResult::FfiUnsafe { ty, reason, help } => {
                 self.emit_ffi_unsafe_type_lint(ty, sp, &reason, help.as_deref());
             }

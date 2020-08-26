@@ -1,11 +1,11 @@
 use crate::rmeta::*;
 
-use log::debug;
 use rustc_index::vec::Idx;
-use rustc_serialize::{opaque::Encoder, Encodable};
+use rustc_serialize::opaque::Encoder;
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use tracing::debug;
 
 /// Helper trait, for encoding to, and decoding from, a fixed number of bytes.
 /// Used mainly for Lazy positions and lengths.
@@ -78,7 +78,7 @@ impl FixedSizeEncoding for u32 {
 // NOTE(eddyb) there could be an impl for `usize`, which would enable a more
 // generic `Lazy<T>` impl, but in the general case we might not need / want to
 // fit every `usize` in `u32`.
-impl<T: Encodable> FixedSizeEncoding for Option<Lazy<T>> {
+impl<T> FixedSizeEncoding for Option<Lazy<T>> {
     fixed_size_encoding_byte_len_and_defaults!(u32::BYTE_LEN);
 
     fn from_bytes(b: &[u8]) -> Self {
@@ -93,7 +93,7 @@ impl<T: Encodable> FixedSizeEncoding for Option<Lazy<T>> {
     }
 }
 
-impl<T: Encodable> FixedSizeEncoding for Option<Lazy<[T]>> {
+impl<T> FixedSizeEncoding for Option<Lazy<[T]>> {
     fixed_size_encoding_byte_len_and_defaults!(u32::BYTE_LEN * 2);
 
     fn from_bytes(b: &[u8]) -> Self {
@@ -200,5 +200,10 @@ where
         let start = self.position.get();
         let bytes = &metadata.raw_bytes()[start..start + self.meta];
         <Option<T>>::maybe_read_from_bytes_at(bytes, i.index())?
+    }
+
+    /// Size of the table in entries, including possible gaps.
+    pub(super) fn size(&self) -> usize {
+        self.meta / <Option<T>>::BYTE_LEN
     }
 }

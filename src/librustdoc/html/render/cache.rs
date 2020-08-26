@@ -48,7 +48,7 @@ pub fn extern_location(
     // external crate
     e.attrs
         .lists(sym::doc)
-        .filter(|a| a.check_name(sym::html_root_url))
+        .filter(|a| a.has_name(sym::html_root_url))
         .filter_map(|a| a.value_str())
         .map(|url| {
             let mut url = url.to_string();
@@ -200,10 +200,12 @@ fn get_index_type_name(clean_type: &clean::Type, accept_generic: bool) -> Option
     match *clean_type {
         clean::ResolvedPath { ref path, .. } => {
             let segments = &path.segments;
-            let path_segment = segments.iter().last().unwrap_or_else(|| panic!(
+            let path_segment = segments.iter().last().unwrap_or_else(|| {
+                panic!(
                 "get_index_type_name(clean_type: {:?}, accept_generic: {:?}) had length zero path",
                 clean_type, accept_generic
-            ));
+            )
+            });
             Some(path_segment.name.clone())
         }
         clean::Generic(ref s) if accept_generic => Some(s.clone()),

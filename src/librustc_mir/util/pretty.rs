@@ -387,20 +387,35 @@ impl Visitor<'tcx> for ExtraComments<'tcx> {
     fn visit_constant(&mut self, constant: &Constant<'tcx>, location: Location) {
         self.super_constant(constant, location);
         let Constant { span, user_ty, literal } = constant;
-        self.push("mir::Constant");
-        self.push(&format!("+ span: {}", self.tcx.sess.source_map().span_to_string(*span)));
-        if let Some(user_ty) = user_ty {
-            self.push(&format!("+ user_ty: {:?}", user_ty));
+        match literal.ty.kind {
+            ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char => {}
+            // Unit type
+            ty::Tuple(tys) if tys.is_empty() => {}
+            _ => {
+                self.push("mir::Constant");
+                self.push(&format!("+ span: {}", self.tcx.sess.source_map().span_to_string(*span)));
+                if let Some(user_ty) = user_ty {
+                    self.push(&format!("+ user_ty: {:?}", user_ty));
+                }
+                self.push(&format!("+ literal: {:?}", literal));
+            }
         }
-        self.push(&format!("+ literal: {:?}", literal));
     }
 
     fn visit_const(&mut self, constant: &&'tcx ty::Const<'tcx>, _: Location) {
         self.super_const(constant);
         let ty::Const { ty, val, .. } = constant;
-        self.push("ty::Const");
-        self.push(&format!("+ ty: {:?}", ty));
-        self.push(&format!("+ val: {:?}", val));
+        match ty.kind {
+            ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char | ty::Float(_) => {}
+            // Unit type
+            ty::Tuple(tys) if tys.is_empty() => {}
+            ty::FnDef(..) => {}
+            _ => {
+                self.push("ty::Const");
+                self.push(&format!("+ ty: {:?}", ty));
+                self.push(&format!("+ val: {:?}", val));
+            }
+        }
     }
 
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
@@ -743,8 +758,8 @@ fn write_allocation_bytes<Tag: Copy + Debug, Extra>(
         if let Some(&(tag, target_id)) = alloc.relocations().get(&i) {
             // Memory with a relocation must be defined
             let j = i.bytes_usize();
-            let offset =
-                alloc.inspect_with_undef_and_ptr_outside_interpreter(j..j + ptr_size.bytes_usize());
+            let offset = alloc
+                .inspect_with_uninit_and_ptr_outside_interpreter(j..j + ptr_size.bytes_usize());
             let offset = read_target_uint(tcx.data_layout.endian, offset).unwrap();
             let offset = Size::from_bytes(offset);
             let relocation_width = |bytes| bytes * 3;
@@ -803,7 +818,7 @@ fn write_allocation_bytes<Tag: Copy + Debug, Extra>(
 
             // Checked definedness (and thus range) and relocations. This access also doesn't
             // influence interpreter execution but is only for debugging.
-            let c = alloc.inspect_with_undef_and_ptr_outside_interpreter(j..j + 1)[0];
+            let c = alloc.inspect_with_uninit_and_ptr_outside_interpreter(j..j + 1)[0];
             write!(w, "{:02x}", c)?;
             if c.is_ascii_control() || c >= 0x80 {
                 ascii.push('.');

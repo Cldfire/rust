@@ -12,7 +12,6 @@ use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, DefIdTree, Ty, TyCtxt, TypeFoldable};
 use rustc_span::symbol::Ident;
 use rustc_span::{Span, DUMMY_SP};
-use rustc_trait_selection::traits;
 
 use super::ItemCtxt;
 use super::{bad_placeholder_type, is_suggestable_infer_ty};
@@ -23,7 +22,7 @@ use super::{bad_placeholder_type, is_suggestable_infer_ty};
 pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<DefId> {
     use hir::*;
 
-    let hir_id = tcx.hir().as_local_hir_id(def_id);
+    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
 
     if let Node::AnonConst(_) = tcx.hir().get(hir_id) {
         let parent_node_id = tcx.hir().get_parent_node(hir_id);
@@ -138,7 +137,7 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
     let def_id = def_id.expect_local();
     use rustc_hir::*;
 
-    let hir_id = tcx.hir().as_local_hir_id(def_id);
+    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
 
     let icx = ItemCtxt::new(tcx, def_id.to_def_id());
 
@@ -323,70 +322,8 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
         }
 
         Node::GenericParam(param) => match &param.kind {
-            GenericParamKind::Type { default: Some(ref ty), .. } => icx.to_ty(ty),
-            GenericParamKind::Const { ty: ref hir_ty, .. } => {
-                let ty = icx.to_ty(hir_ty);
-                let err = match ty.peel_refs().kind {
-                    ty::FnPtr(_) => Some("function pointers"),
-                    ty::RawPtr(_) => Some("raw pointers"),
-                    _ => None,
-                };
-                if let Some(unsupported_type) = err {
-                    tcx.sess
-                        .struct_span_err(
-                            hir_ty.span,
-                            &format!(
-                                "using {} as const generic parameters is forbidden",
-                                unsupported_type
-                            ),
-                        )
-                        .emit();
-                };
-                if traits::search_for_structural_match_violation(param.hir_id, param.span, tcx, ty)
-                    .is_some()
-                {
-                    // We use the same error code in both branches, because this is really the same
-                    // issue: we just special-case the message for type parameters to make it
-                    // clearer.
-                    if let ty::Param(_) = ty.peel_refs().kind {
-                        // Const parameters may not have type parameters as their types,
-                        // because we cannot be sure that the type parameter derives `PartialEq`
-                        // and `Eq` (just implementing them is not enough for `structural_match`).
-                        struct_span_err!(
-                            tcx.sess,
-                            hir_ty.span,
-                            E0741,
-                            "`{}` is not guaranteed to `#[derive(PartialEq, Eq)]`, so may not be \
-                             used as the type of a const parameter",
-                            ty,
-                        )
-                        .span_label(
-                            hir_ty.span,
-                            format!("`{}` may not derive both `PartialEq` and `Eq`", ty),
-                        )
-                        .note(
-                            "it is not currently possible to use a type parameter as the type of a \
-                             const parameter",
-                        )
-                        .emit();
-                    } else {
-                        struct_span_err!(
-                            tcx.sess,
-                            hir_ty.span,
-                            E0741,
-                            "`{}` must be annotated with `#[derive(PartialEq, Eq)]` to be used as \
-                             the type of a const parameter",
-                            ty,
-                        )
-                        .span_label(
-                            hir_ty.span,
-                            format!("`{}` doesn't derive both `PartialEq` and `Eq`", ty),
-                        )
-                        .emit();
-                    }
-                }
-                ty
-            }
+            GenericParamKind::Type { default: Some(ty), .. }
+            | GenericParamKind::Const { ty, .. } => icx.to_ty(ty),
             x => bug!("unexpected non-type Node::GenericParam: {:?}", x),
         },
 
@@ -546,7 +483,7 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
         }
     }
 
-    let hir_id = tcx.hir().as_local_hir_id(def_id);
+    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
     let scope = tcx.hir().get_defining_scope(hir_id);
     let mut locator = ConstraintLocator { def_id: def_id.to_def_id(), tcx, found: None };
 
@@ -599,7 +536,7 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
 ///    by the time we borrow check, and it's not clear how we should handle
 ///    those.
 fn let_position_impl_trait_type(tcx: TyCtxt<'_>, opaque_ty_id: LocalDefId) -> Ty<'_> {
-    let scope = tcx.hir().get_defining_scope(tcx.hir().as_local_hir_id(opaque_ty_id));
+    let scope = tcx.hir().get_defining_scope(tcx.hir().local_def_id_to_hir_id(opaque_ty_id));
     let scope_def_id = tcx.hir().local_def_id(scope);
 
     let opaque_ty_def_id = opaque_ty_id.to_def_id();
@@ -635,7 +572,7 @@ fn let_position_impl_trait_type(tcx: TyCtxt<'_>, opaque_ty_id: LocalDefId) -> Ty
     if concrete_ty.has_erased_regions() {
         // FIXME(impl_trait_in_bindings) Handle this case.
         tcx.sess.span_fatal(
-            tcx.hir().span(tcx.hir().as_local_hir_id(opaque_ty_id)),
+            tcx.hir().span(tcx.hir().local_def_id_to_hir_id(opaque_ty_id)),
             "lifetimes in impl Trait types in bindings are not currently supported",
         );
     }

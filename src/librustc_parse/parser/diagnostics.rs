@@ -1,13 +1,13 @@
 use super::ty::AllowPlus;
 use super::{BlockMode, Parser, PathStyle, SemiColonMode, SeqSep, TokenExpectType, TokenType};
 
-use rustc_ast::ast::{
-    self, AngleBracketedArgs, AttrVec, BinOpKind, BindingMode, BlockCheckMode, Expr, ExprKind,
-    Item, ItemKind, Mutability, Param, Pat, PatKind, PathSegment, QSelf, Ty, TyKind,
-};
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Lit, LitKind, TokenKind};
 use rustc_ast::util::parser::AssocOp;
+use rustc_ast::{
+    self as ast, AngleBracketedArgs, AttrVec, BinOpKind, BindingMode, BlockCheckMode, Expr,
+    ExprKind, Item, ItemKind, Mutability, Param, Pat, PatKind, PathSegment, QSelf, Ty, TyKind,
+};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{pluralize, struct_span_err};
@@ -16,7 +16,7 @@ use rustc_span::source_map::Spanned;
 use rustc_span::symbol::{kw, Ident};
 use rustc_span::{MultiSpan, Span, SpanSnippetError, DUMMY_SP};
 
-use log::{debug, trace};
+use tracing::{debug, trace};
 
 const TURBOFISH: &str = "use `::<...>` instead of `<...>` to specify type arguments";
 
@@ -26,6 +26,7 @@ pub(super) fn dummy_arg(ident: Ident) -> Param {
         id: ast::DUMMY_NODE_ID,
         kind: PatKind::Ident(BindingMode::ByValue(Mutability::Not), ident, None),
         span: ident.span,
+        tokens: None,
     });
     let ty = Ty { kind: TyKind::Err, span: ident.span, id: ast::DUMMY_NODE_ID };
     Param {
@@ -83,7 +84,12 @@ impl RecoverQPath for Pat {
         self.to_ty()
     }
     fn recovered(qself: Option<QSelf>, path: ast::Path) -> Self {
-        Self { span: path.span, kind: PatKind::Path(qself, path), id: ast::DUMMY_NODE_ID }
+        Self {
+            span: path.span,
+            kind: PatKind::Path(qself, path),
+            id: ast::DUMMY_NODE_ID,
+            tokens: None,
+        }
     }
 }
 
@@ -1419,7 +1425,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn eat_incorrect_doc_comment_for_param_type(&mut self) {
-        if let token::DocComment(_) = self.token.kind {
+        if let token::DocComment(..) = self.token.kind {
             self.struct_span_err(
                 self.token.span,
                 "documentation comments cannot be applied to a function parameter's type",
@@ -1526,7 +1532,8 @@ impl<'a> Parser<'a> {
         .emit();
 
         // Pretend the pattern is `_`, to avoid duplicate errors from AST validation.
-        let pat = P(Pat { kind: PatKind::Wild, span: pat.span, id: ast::DUMMY_NODE_ID });
+        let pat =
+            P(Pat { kind: PatKind::Wild, span: pat.span, id: ast::DUMMY_NODE_ID, tokens: None });
         Ok((pat, ty))
     }
 

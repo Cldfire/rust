@@ -3,13 +3,15 @@ use crate::coverageinfo;
 use crate::llvm;
 
 use llvm::coverageinfo::CounterMappingRegion;
-use log::debug;
-use rustc_codegen_ssa::coverageinfo::map::{Counter, CounterExpression, Region};
+use rustc_codegen_ssa::coverageinfo::map::{Counter, CounterExpression};
 use rustc_codegen_ssa::traits::{BaseTypeMethods, ConstMethods};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_llvm::RustString;
+use rustc_middle::mir::coverage::CodeRegion;
 
 use std::ffi::CString;
+
+use tracing::debug;
 
 /// Generates and exports the Coverage Map.
 ///
@@ -76,13 +78,12 @@ pub fn finalize<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) {
 }
 
 struct CoverageMapGenerator {
-    filenames: Vec<CString>,
-    filename_to_index: FxHashMap<CString, u32>,
+    filenames: FxIndexSet<CString>,
 }
 
 impl CoverageMapGenerator {
     fn new() -> Self {
-        Self { filenames: Vec::new(), filename_to_index: FxHashMap::default() }
+        Self { filenames: FxIndexSet::default() }
     }
 
     /// Using the `expressions` and `counter_regions` collected for the current function, generate
@@ -92,7 +93,7 @@ impl CoverageMapGenerator {
     fn write_coverage_mappings(
         &mut self,
         expressions: Vec<CounterExpression>,
-        counter_regions: impl Iterator<Item = (Counter, &'a Region)>,
+        counter_regions: impl Iterator<Item = (Counter, &'a CodeRegion)>,
         coverage_mappings_buffer: &RustString,
     ) {
         let mut counter_regions = counter_regions.collect::<Vec<_>>();
@@ -102,36 +103,28 @@ impl CoverageMapGenerator {
 
         let mut virtual_file_mapping = Vec::new();
         let mut mapping_regions = Vec::new();
-        let mut current_file_path = None;
+        let mut current_file_name = None;
         let mut current_file_id = 0;
 
-        // Convert the list of (Counter, Region) pairs to an array of `CounterMappingRegion`, sorted
+        // Convert the list of (Counter, CodeRegion) pairs to an array of `CounterMappingRegion`, sorted
         // by filename and position. Capture any new files to compute the `CounterMappingRegion`s
         // `file_id` (indexing files referenced by the current function), and construct the
         // function-specific `virtual_file_mapping` from `file_id` to its index in the module's
         // `filenames` array.
         counter_regions.sort_unstable_by_key(|(_counter, region)| *region);
         for (counter, region) in counter_regions {
-            let (file_path, start_line, start_col, end_line, end_col) = region.file_start_and_end();
-            let same_file = current_file_path.as_ref().map_or(false, |p| p == file_path);
+            let CodeRegion { file_name, start_line, start_col, end_line, end_col } = *region;
+            let same_file = current_file_name.as_ref().map_or(false, |p| *p == file_name);
             if !same_file {
-                if current_file_path.is_some() {
+                if current_file_name.is_some() {
                     current_file_id += 1;
                 }
-                current_file_path = Some(file_path.clone());
-                let filename = CString::new(file_path.to_string_lossy().to_string())
+                current_file_name = Some(file_name);
+                let c_filename = CString::new(file_name.to_string())
                     .expect("null error converting filename to C string");
-                debug!("  file_id: {} = '{:?}'", current_file_id, filename);
-                let filenames_index = match self.filename_to_index.get(&filename) {
-                    Some(index) => *index,
-                    None => {
-                        let index = self.filenames.len() as u32;
-                        self.filenames.push(filename.clone());
-                        self.filename_to_index.insert(filename.clone(), index);
-                        index
-                    }
-                };
-                virtual_file_mapping.push(filenames_index);
+                debug!("  file_id: {} = '{:?}'", current_file_id, c_filename);
+                let (filenames_index, _) = self.filenames.insert_full(c_filename);
+                virtual_file_mapping.push(filenames_index as u32);
             }
             mapping_regions.push(CounterMappingRegion::code_region(
                 counter,

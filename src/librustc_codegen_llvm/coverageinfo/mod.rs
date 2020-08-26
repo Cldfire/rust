@@ -5,17 +5,21 @@ use crate::common::CodegenCx;
 
 use libc::c_uint;
 use llvm::coverageinfo::CounterMappingRegion;
-use log::debug;
-use rustc_codegen_ssa::coverageinfo::map::{CounterExpression, ExprKind, FunctionCoverage};
+use rustc_codegen_ssa::coverageinfo::map::{CounterExpression, FunctionCoverage};
 use rustc_codegen_ssa::traits::{
-    BaseTypeMethods, CoverageInfoBuilderMethods, CoverageInfoMethods, StaticMethods,
+    BaseTypeMethods, CoverageInfoBuilderMethods, CoverageInfoMethods, MiscMethods, StaticMethods,
 };
 use rustc_data_structures::fx::FxHashMap;
 use rustc_llvm::RustString;
+use rustc_middle::mir::coverage::{
+    CodeRegion, CounterValueReference, ExpressionOperandId, InjectedExpressionIndex, Op,
+};
 use rustc_middle::ty::Instance;
 
 use std::cell::RefCell;
 use std::ffi::CString;
+
+use tracing::debug;
 
 pub mod mapgen;
 
@@ -24,7 +28,7 @@ const COVMAP_VAR_ALIGN_BYTES: usize = 8;
 /// A context object for maintaining all state needed by the coverageinfo module.
 pub struct CrateCoverageContext<'tcx> {
     // Coverage region data for each instrumented function identified by DefId.
-    pub(crate) function_coverage_map: RefCell<FxHashMap<Instance<'tcx>, FunctionCoverage<'tcx>>>,
+    pub(crate) function_coverage_map: RefCell<FxHashMap<Instance<'tcx>, FunctionCoverage>>,
 }
 
 impl<'tcx> CrateCoverageContext<'tcx> {
@@ -32,7 +36,7 @@ impl<'tcx> CrateCoverageContext<'tcx> {
         Self { function_coverage_map: Default::default() }
     }
 
-    pub fn take_function_coverage_map(&self) -> FxHashMap<Instance<'tcx>, FunctionCoverage<'tcx>> {
+    pub fn take_function_coverage_map(&self) -> FxHashMap<Instance<'tcx>, FunctionCoverage> {
         self.function_coverage_map.replace(FxHashMap::default())
     }
 }
@@ -44,75 +48,74 @@ impl CoverageInfoMethods for CodegenCx<'ll, 'tcx> {
 }
 
 impl CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
+    /// Calls llvm::createPGOFuncNameVar() with the given function instance's mangled function name.
+    /// The LLVM API returns an llvm::GlobalVariable containing the function name, with the specific
+    /// variable name and linkage required by LLVM InstrProf source-based coverage instrumentation.
+    fn create_pgo_func_name_var(&self, instance: Instance<'tcx>) -> Self::Value {
+        let llfn = self.cx.get_fn(instance);
+        let mangled_fn_name = CString::new(self.tcx.symbol_name(instance).name)
+            .expect("error converting function name to C string");
+        unsafe { llvm::LLVMRustCoverageCreatePGOFuncNameVar(llfn, mangled_fn_name.as_ptr()) }
+    }
+
     fn add_counter_region(
         &mut self,
         instance: Instance<'tcx>,
         function_source_hash: u64,
-        id: u32,
-        start_byte_pos: u32,
-        end_byte_pos: u32,
+        id: CounterValueReference,
+        region: CodeRegion,
     ) {
         debug!(
-            "adding counter to coverage_regions: instance={:?}, function_source_hash={}, id={}, \
-             byte range {}..{}",
-            instance, function_source_hash, id, start_byte_pos, end_byte_pos,
+            "adding counter to coverage_regions: instance={:?}, function_source_hash={}, id={:?}, \
+             at {:?}",
+            instance, function_source_hash, id, region,
         );
         let mut coverage_regions = self.coverage_context().function_coverage_map.borrow_mut();
         coverage_regions
             .entry(instance)
             .or_insert_with(|| FunctionCoverage::new(self.tcx, instance))
-            .add_counter(function_source_hash, id, start_byte_pos, end_byte_pos);
+            .add_counter(function_source_hash, id, region);
     }
 
     fn add_counter_expression_region(
         &mut self,
         instance: Instance<'tcx>,
-        id_descending_from_max: u32,
-        lhs: u32,
-        op: ExprKind,
-        rhs: u32,
-        start_byte_pos: u32,
-        end_byte_pos: u32,
+        id: InjectedExpressionIndex,
+        lhs: ExpressionOperandId,
+        op: Op,
+        rhs: ExpressionOperandId,
+        region: CodeRegion,
     ) {
         debug!(
-            "adding counter expression to coverage_regions: instance={:?}, id={}, {} {:?} {}, \
-             byte range {}..{}",
-            instance, id_descending_from_max, lhs, op, rhs, start_byte_pos, end_byte_pos,
+            "adding counter expression to coverage_regions: instance={:?}, id={:?}, {:?} {:?} {:?}, \
+             at {:?}",
+            instance, id, lhs, op, rhs, region,
         );
         let mut coverage_regions = self.coverage_context().function_coverage_map.borrow_mut();
         coverage_regions
             .entry(instance)
             .or_insert_with(|| FunctionCoverage::new(self.tcx, instance))
-            .add_counter_expression(
-                id_descending_from_max,
-                lhs,
-                op,
-                rhs,
-                start_byte_pos,
-                end_byte_pos,
-            );
+            .add_counter_expression(id, lhs, op, rhs, region);
     }
 
-    fn add_unreachable_region(
-        &mut self,
-        instance: Instance<'tcx>,
-        start_byte_pos: u32,
-        end_byte_pos: u32,
-    ) {
+    fn add_unreachable_region(&mut self, instance: Instance<'tcx>, region: CodeRegion) {
         debug!(
-            "adding unreachable code to coverage_regions: instance={:?}, byte range {}..{}",
-            instance, start_byte_pos, end_byte_pos,
+            "adding unreachable code to coverage_regions: instance={:?}, at {:?}",
+            instance, region,
         );
         let mut coverage_regions = self.coverage_context().function_coverage_map.borrow_mut();
         coverage_regions
             .entry(instance)
             .or_insert_with(|| FunctionCoverage::new(self.tcx, instance))
-            .add_unreachable_region(start_byte_pos, end_byte_pos);
+            .add_unreachable_region(region);
     }
 }
 
-pub(crate) fn write_filenames_section_to_buffer(filenames: &Vec<CString>, buffer: &RustString) {
-    let c_str_vec = filenames.iter().map(|cstring| cstring.as_ptr()).collect::<Vec<_>>();
+pub(crate) fn write_filenames_section_to_buffer<'a>(
+    filenames: impl IntoIterator<Item = &'a CString>,
+    buffer: &RustString,
+) {
+    let c_str_vec = filenames.into_iter().map(|cstring| cstring.as_ptr()).collect::<Vec<_>>();
     unsafe {
         llvm::LLVMRustCoverageWriteFilenamesSectionToBuffer(
             c_str_vec.as_ptr(),

@@ -7,7 +7,7 @@ use std::hash::Hash;
 
 use rustc_data_structures::fx::FxHashMap;
 
-use rustc_ast::ast::Mutability;
+use rustc_ast::Mutability;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::AssertMessage;
 use rustc_session::Limit;
@@ -299,6 +299,19 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         }
 
         Ok(())
+    }
+
+    #[inline(always)]
+    fn init_frame_extra(
+        ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        frame: Frame<'mir, 'tcx>,
+    ) -> InterpResult<'tcx, Frame<'mir, 'tcx>> {
+        // Enforce stack size limit. Add 1 because this is run before the new frame is pushed.
+        if !ecx.tcx.sess.recursion_limit().value_within_limit(ecx.stack().len() + 1) {
+            throw_exhaust!(StackFrameLimitReached)
+        } else {
+            Ok(frame)
+        }
     }
 
     #[inline(always)]

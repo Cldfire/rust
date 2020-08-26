@@ -2,13 +2,13 @@ use crate::interface::{Compiler, Result};
 use crate::proc_macro_decls;
 use crate::util;
 
-use log::{info, warn};
 use once_cell::sync::Lazy;
 use rustc_ast::mut_visit::MutVisitor;
-use rustc_ast::{self, ast, visit};
+use rustc_ast::{self as ast, visit};
 use rustc_codegen_ssa::back::link::emit_metadata;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::sync::{par_iter, Lrc, OnceCell, ParallelIterator, WorkerLocal};
+use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_data_structures::{box_region_allow_access, declare_box_region_type, parallel};
 use rustc_errors::{ErrorReported, PResult};
 use rustc_expand::base::ExtCtxt;
@@ -30,7 +30,6 @@ use rustc_passes::{self, hir_stats, layout_test};
 use rustc_plugin_impl as plugin;
 use rustc_resolve::{Resolver, ResolverArenas};
 use rustc_session::config::{CrateType, Input, OutputFilenames, OutputType, PpMode, PpSourceMode};
-use rustc_session::lint;
 use rustc_session::output::{filename_for_input, filename_for_metadata};
 use rustc_session::search_paths::PathKind;
 use rustc_session::Session;
@@ -38,6 +37,7 @@ use rustc_span::symbol::Symbol;
 use rustc_span::{FileName, RealFileName};
 use rustc_trait_selection::traits;
 use rustc_typeck as typeck;
+use tracing::{info, warn};
 
 use rustc_serialize::json;
 use tempfile::Builder as TempFileBuilder;
@@ -103,7 +103,7 @@ pub fn configure_and_expand(
     krate: ast::Crate,
     crate_name: &str,
 ) -> Result<(ast::Crate, BoxedResolver)> {
-    log::trace!("configure_and_expand");
+    tracing::trace!("configure_and_expand");
     // Currently, we ignore the name resolution data structures for the purposes of dependency
     // tracking. Instead we will run name resolution and include its output in the hash of each
     // item, much like we do for macro expansion. In other words, the hash reflects not just
@@ -162,12 +162,7 @@ pub fn register_plugins<'a>(
         )
     });
 
-    let (krate, features) = rustc_expand::config::features(
-        krate,
-        &sess.parse_sess,
-        sess.edition(),
-        &sess.opts.debugging_opts.allow_features,
-    );
+    let (krate, features) = rustc_expand::config::features(sess, krate);
     // these need to be set "early" so that expansion sees `quote` if enabled.
     sess.init_features(features);
 
@@ -233,7 +228,7 @@ fn configure_and_expand_inner<'a>(
     resolver_arenas: &'a ResolverArenas<'a>,
     metadata_loader: &'a MetadataLoaderDyn,
 ) -> Result<(ast::Crate, Resolver<'a>)> {
-    log::trace!("configure_and_expand_inner");
+    tracing::trace!("configure_and_expand_inner");
     pre_expansion_lint(sess, lint_store, &krate);
 
     let mut resolver = Resolver::new(sess, &krate, crate_name, metadata_loader, &resolver_arenas);
@@ -244,7 +239,7 @@ fn configure_and_expand_inner<'a>(
         let (krate, name) = rustc_builtin_macros::standard_library_imports::inject(
             krate,
             &mut resolver,
-            &sess.parse_sess,
+            &sess,
             alt_std_name,
         );
         if let Some(name) = name {
@@ -253,7 +248,7 @@ fn configure_and_expand_inner<'a>(
         krate
     });
 
-    util::check_attr_crate_type(&krate.attrs, &mut resolver.lint_buffer());
+    util::check_attr_crate_type(&sess, &krate.attrs, &mut resolver.lint_buffer());
 
     // Expand all macros
     krate = sess.time("macro_expand_crate", || {
@@ -300,7 +295,7 @@ fn configure_and_expand_inner<'a>(
         };
 
         let extern_mod_loaded = |k: &ast::Crate| pre_expansion_lint(sess, lint_store, k);
-        let mut ecx = ExtCtxt::new(&sess.parse_sess, cfg, &mut resolver, Some(&extern_mod_loaded));
+        let mut ecx = ExtCtxt::new(&sess, cfg, &mut resolver, Some(&extern_mod_loaded));
 
         // Expand macros now!
         let krate = sess.time("expand_crate", || ecx.monotonic_expander().expand_crate(krate));
@@ -311,26 +306,11 @@ fn configure_and_expand_inner<'a>(
             ecx.check_unused_macros();
         });
 
-        let mut missing_fragment_specifiers: Vec<_> = ecx
-            .parse_sess
-            .missing_fragment_specifiers
-            .borrow()
-            .iter()
-            .map(|(span, node_id)| (*span, *node_id))
-            .collect();
-        missing_fragment_specifiers.sort_unstable_by_key(|(span, _)| *span);
-
-        let recursion_limit_hit = ecx.reduced_recursion_limit.is_some();
-
-        for (span, node_id) in missing_fragment_specifiers {
-            let lint = lint::builtin::MISSING_FRAGMENT_SPECIFIER;
-            let msg = "missing fragment specifier";
-            resolver.lint_buffer().buffer_lint(lint, node_id, span, msg);
-        }
         if cfg!(windows) {
             env::set_var("PATH", &old_path);
         }
 
+        let recursion_limit_hit = ecx.reduced_recursion_limit.is_some();
         if recursion_limit_hit {
             // If we hit a recursion limit, exit early to avoid later passes getting overwhelmed
             // with a large AST
@@ -341,21 +321,11 @@ fn configure_and_expand_inner<'a>(
     })?;
 
     sess.time("maybe_building_test_harness", || {
-        rustc_builtin_macros::test_harness::inject(
-            &sess.parse_sess,
-            &mut resolver,
-            sess.opts.test,
-            &mut krate,
-            sess.diagnostic(),
-            &sess.features_untracked(),
-            sess.panic_strategy(),
-            sess.target.target.options.panic_strategy,
-            sess.opts.debugging_opts.panic_abort_tests,
-        )
+        rustc_builtin_macros::test_harness::inject(&sess, &mut resolver, &mut krate)
     });
 
     if let Some(PpMode::PpmSource(PpSourceMode::PpmEveryBodyLoops)) = sess.opts.pretty {
-        log::debug!("replacing bodies with loop {{}}");
+        tracing::debug!("replacing bodies with loop {{}}");
         util::ReplaceBodyWithLoop::new(&mut resolver).visit_crate(&mut krate);
     }
 
@@ -385,7 +355,7 @@ fn configure_and_expand_inner<'a>(
             let num_crate_types = crate_types.len();
             let is_test_crate = sess.opts.test;
             rustc_builtin_macros::proc_macro_harness::inject(
-                &sess.parse_sess,
+                &sess,
                 &mut resolver,
                 krate,
                 is_proc_macro_crate,
@@ -415,12 +385,7 @@ fn configure_and_expand_inner<'a>(
 
     // Needs to go *after* expansion to be able to check the results of macro expansion.
     sess.time("complete_gated_feature_checking", || {
-        rustc_ast_passes::feature_gate::check_crate(
-            &krate,
-            &sess.parse_sess,
-            &sess.features_untracked(),
-            sess.opts.unstable_features,
-        );
+        rustc_ast_passes::feature_gate::check_crate(&krate, sess);
     });
 
     // Add all buffered lints from the `ParseSess` to the `Session`.
@@ -752,7 +717,8 @@ impl<'tcx> QueryContext<'tcx> {
     where
         F: FnOnce(TyCtxt<'tcx>) -> R,
     {
-        ty::tls::enter_global(self.0, f)
+        let icx = ty::tls::ImplicitCtxt::new(self.0);
+        ty::tls::enter_context(&icx, |_| f(icx.tcx))
     }
 
     pub fn print_stats(&mut self) {
@@ -811,8 +777,9 @@ pub fn create_global_ctxt<'tcx>(
     });
 
     // Do some initialization of the DepGraph that can only be done with the tcx available.
-    ty::tls::enter_global(&gcx, |tcx| {
-        tcx.sess.time("dep_graph_tcx_init", || rustc_incremental::dep_graph_tcx_init(tcx));
+    let icx = ty::tls::ImplicitCtxt::new(&gcx);
+    ty::tls::enter_context(&icx, |_| {
+        icx.tcx.sess.time("dep_graph_tcx_init", || rustc_incremental::dep_graph_tcx_init(icx.tcx));
     });
 
     QueryContext(gcx)
@@ -991,6 +958,7 @@ fn encode_and_write_metadata(
             .prefix("rmeta")
             .tempdir_in(out_filename.parent().unwrap())
             .unwrap_or_else(|err| tcx.sess.fatal(&format!("couldn't create a temp dir: {}", err)));
+        let metadata_tmpdir = MaybeTempDir::new(metadata_tmpdir, tcx.sess.opts.cg.save_temps);
         let metadata_filename = emit_metadata(tcx.sess, &metadata, &metadata_tmpdir);
         if let Err(e) = fs::rename(&metadata_filename, &out_filename) {
             tcx.sess.fatal(&format!("failed to write {}: {}", out_filename.display(), e));

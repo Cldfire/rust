@@ -1,11 +1,11 @@
 use crate::util::check_builtin_macro_attribute;
 
-use rustc_ast::ast::{self, Attribute, Expr, FnHeader, FnSig, Generics, Param};
-use rustc_ast::ast::{ItemKind, Mutability, Stmt, Ty, TyKind, Unsafe};
 use rustc_ast::expand::allocator::{
     AllocatorKind, AllocatorMethod, AllocatorTy, ALLOCATOR_METHODS,
 };
 use rustc_ast::ptr::P;
+use rustc_ast::{self as ast, Attribute, Expr, FnHeader, FnSig, Generics, Param};
+use rustc_ast::{ItemKind, Mutability, Stmt, Ty, TyKind, Unsafe};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
@@ -19,7 +19,7 @@ pub fn expand(
     check_builtin_macro_attribute(ecx, meta_item, sym::global_allocator);
 
     let not_static = |item: Annotatable| {
-        ecx.parse_sess.span_diagnostic.span_err(item.span(), "allocators must be statics");
+        ecx.sess.parse_sess.span_diagnostic.span_err(item.span(), "allocators must be statics");
         vec![item]
     };
     let item = match item {
@@ -67,7 +67,7 @@ impl AllocFnFactory<'_, '_> {
         let (output_ty, output_expr) = self.ret_ty(&method.output, result);
         let decl = self.cx.fn_decl(abi_args, ast::FnRetTy::Ty(output_ty));
         let header = FnHeader { unsafety: Unsafe::Yes(self.span), ..FnHeader::default() };
-        let sig = FnSig { decl, header };
+        let sig = FnSig { decl, header, span: self.span };
         let block = Some(self.cx.block_expr(output_expr));
         let kind = ItemKind::Fn(ast::Defaultness::Final, sig, Generics::default(), block);
         let item = self.cx.item(

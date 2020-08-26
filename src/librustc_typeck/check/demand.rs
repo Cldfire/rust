@@ -6,7 +6,7 @@ use rustc_trait_selection::traits::ObligationCause;
 use rustc_ast::util::parser::PREC_POSTFIX;
 use rustc_errors::{Applicability, DiagnosticBuilder};
 use rustc_hir as hir;
-use rustc_hir::lang_items::CloneTraitLangItem;
+use rustc_hir::lang_items::LangItem;
 use rustc_hir::{is_range_literal, Node};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::{self, AssocItem, Ty, TypeAndMut};
@@ -34,7 +34,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
         self.suggest_boxing_when_appropriate(err, expr, expected, expr_ty);
         self.suggest_missing_await(err, expr, expected, expr_ty);
+        self.suggest_missing_parentheses(err, expr);
         self.note_need_for_fn_pointer(err, expected, expr_ty);
+        self.note_internal_mutation_in_method(err, expr, expected, expr_ty);
     }
 
     // Requires that the two types unify, and prints an error message if
@@ -246,7 +248,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     //
                     // FIXME? Other potential candidate methods: `as_ref` and
                     // `as_mut`?
-                    .any(|a| a.check_name(sym::rustc_conversion_suggestion))
+                    .any(|a| self.sess().check_name(a, sym::rustc_conversion_suggestion))
         });
 
         methods
@@ -463,7 +465,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if self.can_coerce(ref_ty, expected) {
                     let mut sugg_sp = sp;
                     if let hir::ExprKind::MethodCall(ref segment, sp, ref args, _) = expr.kind {
-                        let clone_trait = self.tcx.require_lang_item(CloneTraitLangItem, Some(sp));
+                        let clone_trait = self.tcx.require_lang_item(LangItem::Clone, Some(sp));
                         if let ([arg], Some(true), sym::clone) = (
                             &args[..],
                             self.typeck_results.borrow().type_dependent_def_id(expr.hir_id).map(
@@ -484,7 +486,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             // parenthesize if needed (Issue #46756)
                             hir::ExprKind::Cast(_, _) | hir::ExprKind::Binary(_, _, _) => true,
                             // parenthesize borrows of range literals (Issue #54505)
-                            _ if is_range_literal(self.tcx.sess.source_map(), expr) => true,
+                            _ if is_range_literal(expr) => true,
                             _ => false,
                         };
                         let sugg_expr = if needs_parens { format!("({})", src) } else { src };

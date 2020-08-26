@@ -8,19 +8,18 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::ptr;
 
-use rustc_ast::ast::Mutability;
+use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{self, Instance, ParamEnv, TyCtxt};
+use rustc_middle::ty::{Instance, ParamEnv, TyCtxt};
 use rustc_target::abi::{Align, HasDataLayout, Size, TargetDataLayout};
 
 use super::{
-    AllocId, AllocMap, Allocation, AllocationExtra, CheckInAllocMsg, GlobalAlloc, GlobalId,
-    InterpResult, Machine, MayLeak, Pointer, PointerArithmetic, Scalar,
+    AllocId, AllocMap, Allocation, AllocationExtra, CheckInAllocMsg, GlobalAlloc, InterpResult,
+    Machine, MayLeak, Pointer, PointerArithmetic, Scalar,
 };
 use crate::util::pretty;
 
@@ -117,17 +116,6 @@ pub struct Memory<'mir, 'tcx, M: Machine<'mir, 'tcx>> {
 
     /// Lets us implement `HasDataLayout`, which is awfully convenient.
     pub tcx: TyCtxt<'tcx>,
-}
-
-/// Return the `tcx` allocation containing the initial value of the given static
-pub fn get_static(tcx: TyCtxt<'tcx>, def_id: DefId) -> InterpResult<'tcx, &'tcx Allocation> {
-    trace!("get_static: Need to compute {:?}", def_id);
-    let instance = Instance::mono(tcx, def_id);
-    let gid = GlobalId { instance, promoted: None };
-    // Use the raw query here to break validation cycles. Later uses of the static
-    // will call the full query anyway.
-    let raw_const = tcx.const_eval_raw(ty::ParamEnv::reveal_all().and(gid))?;
-    Ok(tcx.global_alloc(raw_const.alloc_id).unwrap_memory())
 }
 
 impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> HasDataLayout for Memory<'mir, 'tcx, M> {
@@ -392,7 +380,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
             // if this is already a `Pointer` we want to do the bounds checks!
             sptr
         } else {
-            // A "real" access, we must get a pointer.
+            // A "real" access, we must get a pointer to be able to check the bounds.
             Scalar::from(self.force_ptr(sptr)?)
         };
         Ok(match normalized.to_bits_or_ptr(self.pointer_size(), self) {
@@ -423,15 +411,18 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
                 // Test align. Check this last; if both bounds and alignment are violated
                 // we want the error to be about the bounds.
                 if let Some(align) = align {
-                    if alloc_align.bytes() < align.bytes() {
-                        // The allocation itself is not aligned enough.
-                        // FIXME: Alignment check is too strict, depending on the base address that
-                        // got picked we might be aligned even if this check fails.
-                        // We instead have to fall back to converting to an integer and checking
-                        // the "real" alignment.
-                        throw_ub!(AlignmentCheckFailed { has: alloc_align, required: align });
+                    if M::force_int_for_alignment_check(&self.extra) {
+                        let bits = self
+                            .force_bits(ptr.into(), self.pointer_size())
+                            .expect("ptr-to-int cast for align check should never fail");
+                        check_offset_align(bits.try_into().unwrap(), align)?;
+                    } else {
+                        // Check allocation alignment and offset alignment.
+                        if alloc_align.bytes() < align.bytes() {
+                            throw_ub!(AlignmentCheckFailed { has: alloc_align, required: align });
+                        }
+                        check_offset_align(ptr.offset.bytes(), align)?;
                     }
-                    check_offset_align(ptr.offset.bytes(), align)?;
                 }
 
                 // We can still be zero-sized in this branch, in which case we have to
@@ -489,7 +480,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
                     throw_unsup!(ReadExternStatic(def_id));
                 }
 
-                (get_static(tcx, def_id)?, Some(def_id))
+                (tcx.eval_static_initializer(def_id)?, Some(def_id))
             }
         };
         M::before_access_global(memory_extra, id, alloc, def_id, is_write)?;
@@ -926,7 +917,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
         // first copy the relocations to a temporary buffer, because
         // `get_bytes_mut` will clear the relocations, which is correct,
         // since we don't want to keep any relocations at the target.
-        // (`get_bytes_with_undef_and_ptr` below checks that there are no
+        // (`get_bytes_with_uninit_and_ptr` below checks that there are no
         // relocations overlapping the edges; those would not be handled correctly).
         let relocations =
             self.get_raw(src.alloc_id)?.prepare_relocation_copy(self, src, size, dest, length);
@@ -935,7 +926,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
 
         // This checks relocation edges on the src.
         let src_bytes =
-            self.get_raw(src.alloc_id)?.get_bytes_with_undef_and_ptr(&tcx, src, size)?.as_ptr();
+            self.get_raw(src.alloc_id)?.get_bytes_with_uninit_and_ptr(&tcx, src, size)?.as_ptr();
         let dest_bytes =
             self.get_raw_mut(dest.alloc_id)?.get_bytes_mut(&tcx, dest, size * length)?; // `Size` multiplication
 
@@ -948,11 +939,11 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
         let dest_bytes = dest_bytes.as_mut_ptr();
 
         // Prepare a copy of the initialization mask.
-        let compressed = self.get_raw(src.alloc_id)?.compress_undef_range(src, size);
+        let compressed = self.get_raw(src.alloc_id)?.compress_uninit_range(src, size);
 
         if compressed.no_bytes_init() {
             // Fast path: If all bytes are `uninit` then there is nothing to copy. The target range
-            // is marked as unititialized but we otherwise omit changing the byte representation which may
+            // is marked as uninitialized but we otherwise omit changing the byte representation which may
             // be arbitrary for uninitialized bytes.
             // This also avoids writing to the target bytes so that the backing allocation is never
             // touched if the bytes stay uninitialized for the whole interpreter execution. On contemporary

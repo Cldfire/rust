@@ -3,10 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use log::debug;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::DiagnosticBuilder;
 use rustc_middle::ty::RegionVid;
+use tracing::debug;
 
 use smallvec::SmallVec;
 
@@ -257,7 +257,7 @@ impl OutlivesSuggestionBuilder {
         };
 
         // We want this message to appear after other messages on the mir def.
-        let mir_span = mbcx.infcx.tcx.def_span(mbcx.mir_def_id);
+        let mir_span = mbcx.body.span;
         diag.sort_span = mir_span.shrink_to_hi();
 
         // Buffer the diagnostic

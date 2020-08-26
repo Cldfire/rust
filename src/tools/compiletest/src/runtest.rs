@@ -30,7 +30,7 @@ use std::str;
 
 use glob::glob;
 use lazy_static::lazy_static;
-use log::*;
+use tracing::*;
 
 use crate::extract_gdb_version;
 use crate::is_android_gdb_target;
@@ -114,7 +114,7 @@ pub struct Mismatch {
 
 impl Mismatch {
     fn new(line_number: u32) -> Mismatch {
-        Mismatch { line_number: line_number, lines: Vec::new() }
+        Mismatch { line_number, lines: Vec::new() }
     }
 }
 
@@ -178,27 +178,30 @@ pub fn make_diff(expected: &str, actual: &str, context_size: usize) -> Vec<Misma
     results
 }
 
-fn print_diff(expected: &str, actual: &str, context_size: usize) {
+fn write_diff(expected: &str, actual: &str, context_size: usize) -> String {
+    use std::fmt::Write;
+    let mut output = String::new();
     let diff_results = make_diff(expected, actual, context_size);
     for result in diff_results {
         let mut line_number = result.line_number;
         for line in result.lines {
             match line {
                 DiffLine::Expected(e) => {
-                    println!("-\t{}", e);
+                    writeln!(output, "-\t{}", e).unwrap();
                     line_number += 1;
                 }
                 DiffLine::Context(c) => {
-                    println!("{}\t{}", line_number, c);
+                    writeln!(output, "{}\t{}", line_number, c).unwrap();
                     line_number += 1;
                 }
                 DiffLine::Resulting(r) => {
-                    println!("+\t{}", r);
+                    writeln!(output, "+\t{}", r).unwrap();
                 }
             }
         }
-        println!();
+        writeln!(output).unwrap();
     }
+    output
 }
 
 pub fn run(config: Config, testpaths: &TestPaths, revision: Option<&str>) {
@@ -227,7 +230,7 @@ pub fn run(config: Config, testpaths: &TestPaths, revision: Option<&str>) {
     debug!("running {:?}", testpaths.file.display());
     let props = TestProps::from_file(&testpaths.file, revision, &config);
 
-    let cx = TestCx { config: &config, props: &props, testpaths, revision: revision };
+    let cx = TestCx { config: &config, props: &props, testpaths, revision };
     create_dir_all(&cx.output_base_dir()).unwrap();
 
     if config.mode == Incremental {
@@ -575,8 +578,8 @@ impl<'test> TestCx<'test> {
         if self.props.pp_exact.is_some() {
             // Now we have to care about line endings
             let cr = "\r".to_owned();
-            actual = actual.replace(&cr, "").to_owned();
-            expected = expected.replace(&cr, "").to_owned();
+            actual = actual.replace(&cr, "");
+            expected = expected.replace(&cr, "");
         }
 
         self.compare_source(&expected, &actual);
@@ -655,8 +658,12 @@ impl<'test> TestCx<'test> {
                  ------------------------------------------\n\
                  {}\n\
                  ------------------------------------------\n\
-                 \n",
-                expected, actual
+                 diff:\n\
+                 ------------------------------------------\n\
+                 {}\n",
+                expected,
+                actual,
+                write_diff(expected, actual, 3),
             ));
         }
     }
@@ -733,7 +740,7 @@ impl<'test> TestCx<'test> {
         let exe_file = self.make_exe_name();
 
         let prefixes = {
-            static PREFIXES: &'static [&'static str] = &["cdb", "cdbg"];
+            static PREFIXES: &[&str] = &["cdb", "cdbg"];
             // No "native rust support" variation for CDB yet.
             PREFIXES
         };
@@ -804,12 +811,12 @@ impl<'test> TestCx<'test> {
     fn run_debuginfo_gdb_test_no_opt(&self) {
         let prefixes = if self.config.gdb_native_rust {
             // GDB with Rust
-            static PREFIXES: &'static [&'static str] = &["gdb", "gdbr"];
+            static PREFIXES: &[&str] = &["gdb", "gdbr"];
             println!("NOTE: compiletest thinks it is using GDB with native rust support");
             PREFIXES
         } else {
             // Generic GDB
-            static PREFIXES: &'static [&'static str] = &["gdb", "gdbg"];
+            static PREFIXES: &[&str] = &["gdb", "gdbg"];
             println!("NOTE: compiletest thinks it is using GDB without native rust support");
             PREFIXES
         };
@@ -868,12 +875,12 @@ impl<'test> TestCx<'test> {
                 .arg(&exe_file)
                 .arg(&self.config.adb_test_dir)
                 .status()
-                .expect(&format!("failed to exec `{:?}`", adb_path));
+                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", adb_path));
 
             Command::new(adb_path)
                 .args(&["forward", "tcp:5039", "tcp:5039"])
                 .status()
-                .expect(&format!("failed to exec `{:?}`", adb_path));
+                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", adb_path));
 
             let adb_arg = format!(
                 "export LD_LIBRARY_PATH={}; \
@@ -890,7 +897,7 @@ impl<'test> TestCx<'test> {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
-                .expect(&format!("failed to exec `{:?}`", adb_path));
+                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", adb_path));
 
             // Wait for the gdbserver to print out "Listening on port ..."
             // at which point we know that it's started and then we can
@@ -915,7 +922,7 @@ impl<'test> TestCx<'test> {
             let Output { status, stdout, stderr } = Command::new(&gdb_path)
                 .args(debugger_opts)
                 .output()
-                .expect(&format!("failed to exec `{:?}`", gdb_path));
+                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", gdb_path));
             let cmdline = {
                 let mut gdb = Command::new(&format!("{}-gdb", self.config.target));
                 gdb.args(debugger_opts);
@@ -1056,11 +1063,11 @@ impl<'test> TestCx<'test> {
         }
 
         let prefixes = if self.config.lldb_native_rust {
-            static PREFIXES: &'static [&'static str] = &["lldb", "lldbr"];
+            static PREFIXES: &[&str] = &["lldb", "lldbr"];
             println!("NOTE: compiletest thinks it is using LLDB with native rust support");
             PREFIXES
         } else {
-            static PREFIXES: &'static [&'static str] = &["lldb", "lldbg"];
+            static PREFIXES: &[&str] = &["lldb", "lldbg"];
             println!("NOTE: compiletest thinks it is using LLDB without native rust support");
             PREFIXES
         };
@@ -1835,8 +1842,8 @@ impl<'test> TestCx<'test> {
 
         // Need to be sure to put both the lib_path and the aux path in the dylib
         // search path for the child.
-        let mut path = env::split_paths(&env::var_os(dylib_env_var()).unwrap_or(OsString::new()))
-            .collect::<Vec<_>>();
+        let mut path =
+            env::split_paths(&env::var_os(dylib_env_var()).unwrap_or_default()).collect::<Vec<_>>();
         if let Some(p) = aux_path {
             path.insert(0, PathBuf::from(p))
         }
@@ -1847,7 +1854,7 @@ impl<'test> TestCx<'test> {
         command.env(dylib_env_var(), newpath);
 
         let mut child = disable_error_reporting(|| command.spawn())
-            .expect(&format!("failed to exec `{:?}`", &command));
+            .unwrap_or_else(|_| panic!("failed to exec `{:?}`", &command));
         if let Some(input) = input {
             child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
         }
@@ -1878,7 +1885,8 @@ impl<'test> TestCx<'test> {
         emit_metadata: EmitMetadata,
         allow_unused: AllowUnused,
     ) -> Command {
-        let is_rustdoc = self.is_rustdoc();
+        let is_aux = input_file.components().map(|c| c.as_os_str()).any(|c| c == "auxiliary");
+        let is_rustdoc = self.is_rustdoc() && !is_aux;
         let mut rustc = if !is_rustdoc {
             Command::new(&self.config.rustc_path)
         } else {
@@ -1934,6 +1942,7 @@ impl<'test> TestCx<'test> {
                 rustc.args(&[
                     "-Zdump-mir=all",
                     "-Zmir-opt-level=3",
+                    "-Zvalidate-mir",
                     "-Zdump-mir-exclude-pass-number",
                 ]);
 
@@ -2437,8 +2446,8 @@ impl<'test> TestCx<'test> {
 
         self.check_no_compiler_crash(&proc_res, self.props.should_ice);
 
-        const PREFIX: &'static str = "MONO_ITEM ";
-        const CGU_MARKER: &'static str = "@@";
+        const PREFIX: &str = "MONO_ITEM ";
+        const CGU_MARKER: &str = "@@";
 
         let actual: Vec<MonoItem> = proc_res
             .stdout
@@ -2967,7 +2976,7 @@ impl<'test> TestCx<'test> {
                 Filter::MachineApplicableOnly,
             )
             .unwrap_or_default();
-            if suggestions.len() > 0
+            if !suggestions.is_empty()
                 && !self.props.run_rustfix
                 && !self.props.rustfix_only_machine_applicable
             {
@@ -2981,7 +2990,7 @@ impl<'test> TestCx<'test> {
                     .open(coverage_file_path.as_path())
                     .expect("could not create or open file");
 
-                if let Err(_) = writeln!(file, "{}", self.testpaths.file.display()) {
+                if writeln!(file, "{}", self.testpaths.file.display()).is_err() {
                     panic!("couldn't write to {}", coverage_file_path.display());
                 }
             }
@@ -2998,10 +3007,9 @@ impl<'test> TestCx<'test> {
                 },
             )
             .unwrap();
-            let fixed_code = apply_suggestions(&unfixed_code, &suggestions).expect(&format!(
-                "failed to apply suggestions for {:?} with rustfix",
-                self.testpaths.file
-            ));
+            let fixed_code = apply_suggestions(&unfixed_code, &suggestions).unwrap_or_else(|_| {
+                panic!("failed to apply suggestions for {:?} with rustfix", self.testpaths.file)
+            });
 
             errors += self.compare_output("fixed", &fixed_code, &expected_fixed);
         } else if !expected_fixed.is_empty() {
@@ -3227,7 +3235,7 @@ impl<'test> TestCx<'test> {
                     }
                     let expected_string = fs::read_to_string(&expected_file).unwrap();
                     if dumped_string != expected_string {
-                        print_diff(&expected_string, &dumped_string, 3);
+                        print!("{}", write_diff(&expected_string, &dumped_string, 3));
                         panic!(
                             "Actual MIR output differs from expected MIR output {}",
                             expected_file.display()
@@ -3239,8 +3247,19 @@ impl<'test> TestCx<'test> {
     }
 
     fn diff_mir_files(&self, before: PathBuf, after: PathBuf) -> String {
-        let before = self.get_mir_dump_dir().join(before);
-        let after = self.get_mir_dump_dir().join(after);
+        let to_full_path = |path: PathBuf| {
+            let full = self.get_mir_dump_dir().join(&path);
+            if !full.exists() {
+                panic!(
+                    "the mir dump file for {} does not exist (requested in {})",
+                    path.display(),
+                    self.testpaths.file.display(),
+                );
+            }
+            full
+        };
+        let before = to_full_path(before);
+        let after = to_full_path(after);
         debug!("comparing the contents of: {} with {}", before.display(), after.display());
         let before = fs::read_to_string(before).unwrap();
         let after = fs::read_to_string(after).unwrap();
@@ -3452,7 +3471,7 @@ impl<'test> TestCx<'test> {
                 println!("normalized {}:\n{}\n", kind, actual);
             } else {
                 println!("diff of {}:\n", kind);
-                print_diff(expected, actual, 3);
+                print!("{}", write_diff(expected, actual, 3));
             }
         }
 
@@ -3499,7 +3518,7 @@ impl<'test> TestCx<'test> {
         let examined_content =
             self.load_expected_output_from_path(&examined_path).unwrap_or_else(|_| String::new());
 
-        if canon_content == &examined_content {
+        if canon_content == examined_content {
             self.delete_file(&examined_path);
         }
     }
@@ -3566,6 +3585,7 @@ impl ProcRes {
     }
 }
 
+#[derive(Debug)]
 enum TargetLocation {
     ThisFile(PathBuf),
     ThisDirectory(PathBuf),

@@ -247,7 +247,7 @@ rustc_queries! {
             desc { |tcx| "elaborating drops for `{}`", tcx.def_path_str(key.did.to_def_id()) }
         }
 
-        query mir_validated(key: ty::WithOptConstParam<LocalDefId>) ->
+        query mir_promoted(key: ty::WithOptConstParam<LocalDefId>) ->
             (
                 &'tcx Steal<mir::Body<'tcx>>,
                 &'tcx Steal<IndexVec<mir::Promoted, mir::Body<'tcx>>>
@@ -281,6 +281,11 @@ rustc_queries! {
             cache_on_disk_if { key.is_local() }
         }
 
+        /// The `DefId` is the `DefId` of the containing MIR body. Promoteds do not have their own
+        /// `DefId`. This function returns all promoteds in the specified body. The body references
+        /// promoteds by the `DefId` and the `mir::Promoted` index. This is necessary, because
+        /// after inlining a body may refer to promoteds from other bodies. In that case you still
+        /// need to use the `DefId` of the original body.
         query promoted_mir(key: DefId) -> &'tcx IndexVec<mir::Promoted, mir::Body<'tcx>> {
             desc { |tcx| "optimizing promoted MIR for `{}`", tcx.def_path_str(key) }
             cache_on_disk_if { key.is_local() }
@@ -352,7 +357,7 @@ rustc_queries! {
         /// per-type-parameter predicates for resolving `T::AssocTy`.
         query type_param_predicates(key: (DefId, LocalDefId)) -> ty::GenericPredicates<'tcx> {
             desc { |tcx| "computing the bounds for type parameter `{}`", {
-                let id = tcx.hir().as_local_hir_id(key.1);
+                let id = tcx.hir().local_def_id_to_hir_id(key.1);
                 tcx.hir().ty_param_name(id)
             }}
         }
@@ -679,7 +684,7 @@ rustc_queries! {
             -> ConstEvalRawResult<'tcx> {
             desc { |tcx|
                 "const-evaluating `{}`",
-                tcx.def_path_str(key.value.instance.def.def_id())
+                key.value.display(tcx)
             }
         }
 
@@ -695,7 +700,7 @@ rustc_queries! {
             -> ConstEvalResult<'tcx> {
             desc { |tcx|
                 "const-evaluating + checking `{}`",
-                tcx.def_path_str(key.value.instance.def.def_id())
+                key.value.display(tcx)
             }
             cache_on_disk_if(_, opt_result) {
                 // Only store results without errors
@@ -740,7 +745,8 @@ rustc_queries! {
     }
 
     Other {
-        query reachable_set(_: CrateNum) -> &'tcx HirIdSet {
+        query reachable_set(_: CrateNum) -> FxHashSet<LocalDefId> {
+            storage(ArenaCacheSelector<'tcx>)
             desc { "reachability" }
         }
 
@@ -1125,11 +1131,11 @@ rustc_queries! {
 
     TypeChecking {
         query implementations_of_trait(_: (CrateNum, DefId))
-            -> &'tcx [DefId] {
+            -> &'tcx [(DefId, Option<ty::fast_reject::SimplifiedType>)] {
             desc { "looking up implementations of a trait in a crate" }
         }
         query all_trait_implementations(_: CrateNum)
-            -> &'tcx [DefId] {
+            -> &'tcx [(DefId, Option<ty::fast_reject::SimplifiedType>)] {
             desc { "looking up all (?) trait implementations" }
         }
     }
@@ -1186,7 +1192,7 @@ rustc_queries! {
     }
 
     Other {
-        query dep_kind(_: CrateNum) -> DepKind {
+        query dep_kind(_: CrateNum) -> CrateDepKind {
             eval_always
             desc { "fetching what a dependency looks like" }
         }
@@ -1319,7 +1325,7 @@ rustc_queries! {
         query codegen_unit(_: Symbol) -> &'tcx CodegenUnit<'tcx> {
             desc { "codegen_unit" }
         }
-        query unused_generic_params(key: DefId) -> FiniteBitSet<u64> {
+        query unused_generic_params(key: DefId) -> FiniteBitSet<u32> {
             cache_on_disk_if { key.is_local() }
             desc {
                 |tcx| "determining which generic parameters are unused by `{}`",

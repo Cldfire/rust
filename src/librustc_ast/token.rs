@@ -11,13 +11,21 @@ use crate::tokenstream::TokenTree;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::sync::Lrc;
 use rustc_macros::HashStable_Generic;
+use rustc_span::hygiene::ExpnKind;
+use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym};
 use rustc_span::symbol::{Ident, Symbol};
-use rustc_span::{self, Span, DUMMY_SP};
+use rustc_span::{self, FileName, RealFileName, Span, DUMMY_SP};
 use std::borrow::Cow;
 use std::{fmt, mem};
 
-#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
+#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+pub enum CommentKind {
+    Line,
+    Block,
+}
+
+#[derive(Clone, PartialEq, Encodable, Decodable, Hash, Debug, Copy)]
 #[derive(HashStable_Generic)]
 pub enum BinOpToken {
     Plus,
@@ -33,7 +41,7 @@ pub enum BinOpToken {
 }
 
 /// A delimiter token.
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
+#[derive(Clone, PartialEq, Eq, Encodable, Decodable, Hash, Debug, Copy)]
 #[derive(HashStable_Generic)]
 pub enum DelimToken {
     /// A round parenthesis (i.e., `(` or `)`).
@@ -56,7 +64,7 @@ impl DelimToken {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, RustcEncodable, RustcDecodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
 pub enum LitKind {
     Bool, // AST only, must never appear in a `Token`
     Byte,
@@ -71,7 +79,7 @@ pub enum LitKind {
 }
 
 /// A literal token.
-#[derive(Clone, Copy, PartialEq, RustcEncodable, RustcDecodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
 pub struct Lit {
     pub kind: LitKind,
     pub symbol: Symbol,
@@ -182,7 +190,7 @@ fn ident_can_begin_type(name: Symbol, span: Span, is_raw: bool) -> bool {
             .contains(&name)
 }
 
-#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
 pub enum TokenKind {
     /* Expression-operator symbols. */
     Eq,
@@ -238,9 +246,10 @@ pub enum TokenKind {
 
     Interpolated(Lrc<Nonterminal>),
 
-    // Can be expanded into several tokens.
-    /// A doc comment.
-    DocComment(Symbol),
+    /// A doc comment token.
+    /// `Symbol` is the doc comment's data excluding its "quotes" (`///`, `/**`, etc)
+    /// similarly to symbols in string literal tokens.
+    DocComment(CommentKind, ast::AttrStyle, Symbol),
 
     // Junk. These carry no data because we don't really care about the data
     // they *would* carry, and don't really want to allocate a new ident for
@@ -260,7 +269,7 @@ pub enum TokenKind {
 #[cfg(target_arch = "x86_64")]
 rustc_data_structures::static_assert_size!(TokenKind, 16);
 
-#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
@@ -681,7 +690,7 @@ impl PartialEq<TokenKind> for Token {
     }
 }
 
-#[derive(Clone, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Encodable, Decodable)]
 /// For interpolation during macro expansion.
 pub enum Nonterminal {
     NtItem(P<ast::Item>),
@@ -703,6 +712,67 @@ pub enum Nonterminal {
 // `Nonterminal` is used a lot. Make sure it doesn't unintentionally get bigger.
 #[cfg(target_arch = "x86_64")]
 rustc_data_structures::static_assert_size!(Nonterminal, 40);
+
+#[derive(Debug, Copy, Clone, PartialEq, Encodable, Decodable)]
+pub enum NonterminalKind {
+    Item,
+    Block,
+    Stmt,
+    Pat,
+    Expr,
+    Ty,
+    Ident,
+    Lifetime,
+    Literal,
+    Meta,
+    Path,
+    Vis,
+    TT,
+}
+
+impl NonterminalKind {
+    pub fn from_symbol(symbol: Symbol) -> Option<NonterminalKind> {
+        Some(match symbol {
+            sym::item => NonterminalKind::Item,
+            sym::block => NonterminalKind::Block,
+            sym::stmt => NonterminalKind::Stmt,
+            sym::pat => NonterminalKind::Pat,
+            sym::expr => NonterminalKind::Expr,
+            sym::ty => NonterminalKind::Ty,
+            sym::ident => NonterminalKind::Ident,
+            sym::lifetime => NonterminalKind::Lifetime,
+            sym::literal => NonterminalKind::Literal,
+            sym::meta => NonterminalKind::Meta,
+            sym::path => NonterminalKind::Path,
+            sym::vis => NonterminalKind::Vis,
+            sym::tt => NonterminalKind::TT,
+            _ => return None,
+        })
+    }
+    fn symbol(self) -> Symbol {
+        match self {
+            NonterminalKind::Item => sym::item,
+            NonterminalKind::Block => sym::block,
+            NonterminalKind::Stmt => sym::stmt,
+            NonterminalKind::Pat => sym::pat,
+            NonterminalKind::Expr => sym::expr,
+            NonterminalKind::Ty => sym::ty,
+            NonterminalKind::Ident => sym::ident,
+            NonterminalKind::Lifetime => sym::lifetime,
+            NonterminalKind::Literal => sym::literal,
+            NonterminalKind::Meta => sym::meta,
+            NonterminalKind::Path => sym::path,
+            NonterminalKind::Vis => sym::vis,
+            NonterminalKind::TT => sym::tt,
+        }
+    }
+}
+
+impl fmt::Display for NonterminalKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.symbol())
+    }
+}
 
 impl Nonterminal {
     fn span(&self) -> Span {
@@ -739,6 +809,31 @@ impl Nonterminal {
             }
         }
         false
+    }
+
+    // See issue #74616 for details
+    pub fn ident_name_compatibility_hack(
+        &self,
+        orig_span: Span,
+        source_map: &SourceMap,
+    ) -> Option<(Ident, bool)> {
+        if let NtIdent(ident, is_raw) = self {
+            if let ExpnKind::Macro(_, macro_name) = orig_span.ctxt().outer_expn_data().kind {
+                let filename = source_map.span_to_filename(orig_span);
+                if let FileName::Real(RealFileName::Named(path)) = filename {
+                    if (path.ends_with("time-macros-impl/src/lib.rs")
+                        && macro_name == sym::impl_macros)
+                        || (path.ends_with("js-sys/src/lib.rs") && macro_name == sym::arrays)
+                    {
+                        let snippet = source_map.span_to_snippet(orig_span);
+                        if snippet.as_deref() == Ok("$name") {
+                            return Some((*ident, *is_raw));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

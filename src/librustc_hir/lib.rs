@@ -7,8 +7,10 @@
 #![feature(const_panic)]
 #![feature(in_band_lifetimes)]
 #![feature(or_patterns)]
-#![feature(min_specialization)]
 #![recursion_limit = "256"]
+
+#[macro_use]
+extern crate rustc_macros;
 
 #[macro_use]
 extern crate rustc_data_structures;
@@ -17,7 +19,6 @@ mod arena;
 pub mod def;
 pub mod definitions;
 pub use rustc_span::def_id;
-pub mod fake_lang_items;
 mod hir;
 pub mod hir_id;
 pub mod intravisit;

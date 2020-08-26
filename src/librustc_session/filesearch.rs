@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::search_paths::{PathKind, SearchPath, SearchPathFile};
-use log::debug;
 use rustc_fs_util::fix_windows_verbatim_for_gcc;
+use tracing::debug;
 
 #[derive(Copy, Clone)]
 pub enum FileMatch {
@@ -98,7 +98,7 @@ impl<'a> FileSearch<'a> {
         p.push(RUST_LIB_DIR);
         p.push(&self.triple);
         p.push("bin");
-        if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p.clone()] }
+        if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p] }
     }
 }
 

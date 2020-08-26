@@ -399,16 +399,17 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                             err.note(s.as_str());
                         }
                         if let Some(ref s) = enclosing_scope {
-                            let enclosing_scope_span = tcx.def_span(
-                                tcx.hir()
-                                    .opt_local_def_id(obligation.cause.body_id)
-                                    .unwrap_or_else(|| {
-                                        tcx.hir().body_owner_def_id(hir::BodyId {
-                                            hir_id: obligation.cause.body_id,
-                                        })
+                            let body = tcx
+                                .hir()
+                                .opt_local_def_id(obligation.cause.body_id)
+                                .unwrap_or_else(|| {
+                                    tcx.hir().body_owner_def_id(hir::BodyId {
+                                        hir_id: obligation.cause.body_id,
                                     })
-                                    .to_def_id(),
-                            );
+                                });
+
+                            let enclosing_scope_span =
+                                tcx.hir().span_with_body(tcx.hir().local_def_id_to_hir_id(body));
 
                             err.span_label(enclosing_scope_span, s.as_str());
                         }
@@ -568,7 +569,8 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                             self.tcx.sess.source_map().guess_head_span(
                                 self.tcx.hir().span_if_local(closure_def_id).unwrap(),
                             );
-                        let hir_id = self.tcx.hir().as_local_hir_id(closure_def_id.expect_local());
+                        let hir_id =
+                            self.tcx.hir().local_def_id_to_hir_id(closure_def_id.expect_local());
                         let mut err = struct_span_err!(
                             self.tcx.sess,
                             closure_span,

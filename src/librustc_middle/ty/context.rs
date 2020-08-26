@@ -13,17 +13,18 @@ use crate::middle::stability;
 use crate::mir::interpret::{self, Allocation, ConstValue, Scalar};
 use crate::mir::{Body, Field, Local, Place, PlaceElem, ProjectionKind, Promoted};
 use crate::traits;
+use crate::ty::query::{self, TyCtxtAt};
 use crate::ty::steal::Steal;
 use crate::ty::subst::{GenericArg, GenericArgKind, InternalSubsts, Subst, SubstsRef, UserSubsts};
 use crate::ty::TyKind::*;
 use crate::ty::{
-    self, query, AdtDef, AdtKind, BindingMode, BoundVar, CanonicalPolyFnSig, Const, ConstVid,
-    DefIdTree, ExistentialPredicate, FloatVar, FloatVid, GenericParamDefKind, InferConst, InferTy,
-    IntVar, IntVid, List, ParamConst, ParamTy, PolyFnSig, Predicate, PredicateInner, PredicateKind,
+    self, AdtDef, AdtKind, BindingMode, BoundVar, CanonicalPolyFnSig, Const, ConstVid, DefIdTree,
+    ExistentialPredicate, FloatVar, FloatVid, GenericParamDefKind, InferConst, InferTy, IntVar,
+    IntVid, List, ParamConst, ParamTy, PolyFnSig, Predicate, PredicateInner, PredicateKind,
     ProjectionTy, Region, RegionKind, ReprOptions, TraitObjectVisitor, Ty, TyKind, TyS, TyVar,
     TyVid, TypeAndMut,
 };
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_ast::expand::allocator::AllocatorKind;
 use rustc_attr as attr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -39,7 +40,7 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LOCAL_CRATE};
 use rustc_hir::definitions::{DefPathHash, Definitions};
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::lang_items::{self, PanicLocationLangItem};
+use rustc_hir::lang_items::LangItem;
 use rustc_hir::{HirId, ItemKind, ItemLocalId, ItemLocalMap, ItemLocalSet, Node, TraitCandidate};
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_macros::HashStable;
@@ -63,6 +64,12 @@ use std::iter;
 use std::mem;
 use std::ops::{Bound, Deref};
 use std::sync::Arc;
+
+/// A type that is not publicly constructable. This prevents people from making `TyKind::Error`
+/// except through `tcx.err*()`, which are in this module.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[derive(TyEncodable, TyDecodable, HashStable)]
+pub struct DelaySpanBugEmitted(());
 
 type InternedSet<'tcx, T> = ShardedHashMap<Interned<'tcx, T>, ()>;
 
@@ -263,7 +270,7 @@ impl<'a, V> LocalTableInContextMut<'a, V> {
 }
 
 /// All information necessary to validate and reveal an `impl Trait`.
-#[derive(RustcEncodable, RustcDecodable, Debug, HashStable)]
+#[derive(TyEncodable, TyDecodable, Debug, HashStable)]
 pub struct ResolvedOpaqueTy<'tcx> {
     /// The revealed type as seen by this function.
     pub concrete_type: Ty<'tcx>,
@@ -291,7 +298,7 @@ pub struct ResolvedOpaqueTy<'tcx> {
 ///
 /// Here, we would store the type `T`, the span of the value `x`, the "scope-span" for
 /// the scope that contains `x`, the expr `T` evaluated from, and the span of `foo.await`.
-#[derive(RustcEncodable, RustcDecodable, Clone, Debug, Eq, Hash, PartialEq, HashStable)]
+#[derive(TyEncodable, TyDecodable, Clone, Debug, Eq, Hash, PartialEq, HashStable)]
 pub struct GeneratorInteriorTypeCause<'tcx> {
     /// Type of the captured binding.
     pub ty: Ty<'tcx>,
@@ -305,7 +312,7 @@ pub struct GeneratorInteriorTypeCause<'tcx> {
     pub expr: Option<hir::HirId>,
 }
 
-#[derive(RustcEncodable, RustcDecodable, Debug)]
+#[derive(TyEncodable, TyDecodable, Debug)]
 pub struct TypeckResults<'tcx> {
     /// The `HirId::owner` all `ItemLocalId`s in this table are relative to.
     pub hir_owner: LocalDefId,
@@ -445,7 +452,7 @@ impl<'tcx> TypeckResults<'tcx> {
     pub fn qpath_res(&self, qpath: &hir::QPath<'_>, id: hir::HirId) -> Res {
         match *qpath {
             hir::QPath::Resolved(_, ref path) => path.res,
-            hir::QPath::TypeRelative(..) => self
+            hir::QPath::TypeRelative(..) | hir::QPath::LangItem(..) => self
                 .type_dependent_def(id)
                 .map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)),
         }
@@ -728,7 +735,7 @@ rustc_index::newtype_index! {
 pub type CanonicalUserTypeAnnotations<'tcx> =
     IndexVec<UserTypeAnnotationIndex, CanonicalUserTypeAnnotation<'tcx>>;
 
-#[derive(Clone, Debug, RustcEncodable, RustcDecodable, HashStable, TypeFoldable, Lift)]
+#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, Lift)]
 pub struct CanonicalUserTypeAnnotation<'tcx> {
     pub user_ty: CanonicalUserType<'tcx>,
     pub span: Span,
@@ -787,7 +794,7 @@ impl CanonicalUserType<'tcx> {
 /// A user-given type annotation attached to a constant. These arise
 /// from constants that are named via paths, like `Foo::<A>::new` and
 /// so forth.
-#[derive(Copy, Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, Lift)]
 pub enum UserType<'tcx> {
     Ty(Ty<'tcx>),
@@ -1040,7 +1047,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn layout_scalar_valid_range(self, def_id: DefId) -> (Bound<u128>, Bound<u128>) {
         let attrs = self.get_attrs(def_id);
         let get = |name| {
-            let attr = match attrs.iter().find(|a| a.check_name(name)) {
+            let attr = match attrs.iter().find(|a| self.sess.check_name(a, name)) {
                 Some(attr) => attr,
                 None => return Bound::Unbounded,
             };
@@ -1095,20 +1102,13 @@ impl<'tcx> TyCtxt<'tcx> {
         providers[LOCAL_CRATE] = local_providers;
 
         let def_path_hash_to_def_id = if s.opts.build_dep_graph() {
-            let def_path_tables = crates
-                .iter()
-                .map(|&cnum| (cnum, cstore.def_path_table(cnum)))
-                .chain(iter::once((LOCAL_CRATE, definitions.def_path_table())));
+            let capacity = definitions.def_path_table().num_def_ids()
+                + crates.iter().map(|cnum| cstore.num_def_ids(*cnum)).sum::<usize>();
+            let mut map = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
 
-            // Precompute the capacity of the hashmap so we don't have to
-            // re-allocate when populating it.
-            let capacity = def_path_tables.clone().map(|(_, t)| t.size()).sum::<usize>();
-
-            let mut map: FxHashMap<_, _> =
-                FxHashMap::with_capacity_and_hasher(capacity, ::std::default::Default::default());
-
-            for (cnum, def_path_table) in def_path_tables {
-                def_path_table.add_def_path_hashes_to(cnum, &mut map);
+            map.extend(definitions.def_path_table().all_def_path_hashes_and_def_ids(LOCAL_CRATE));
+            for cnum in &crates {
+                map.extend(cstore.all_def_path_hashes_and_def_ids(*cnum).into_iter());
             }
 
             Some(map)
@@ -1170,7 +1170,7 @@ impl<'tcx> TyCtxt<'tcx> {
     #[track_caller]
     pub fn ty_error_with_message<S: Into<MultiSpan>>(self, span: S, msg: &str) -> Ty<'tcx> {
         self.sess.delay_span_bug(span, msg);
-        self.mk_ty(Error(super::sty::DelaySpanBugEmitted(())))
+        self.mk_ty(Error(DelaySpanBugEmitted(())))
     }
 
     /// Like `err` but for constants.
@@ -1178,10 +1178,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn const_error(self, ty: Ty<'tcx>) -> &'tcx Const<'tcx> {
         self.sess
             .delay_span_bug(DUMMY_SP, "ty::ConstKind::Error constructed but no error reported.");
-        self.mk_const(ty::Const {
-            val: ty::ConstKind::Error(super::sty::DelaySpanBugEmitted(())),
-            ty,
-        })
+        self.mk_const(ty::Const { val: ty::ConstKind::Error(DelaySpanBugEmitted(())), ty })
     }
 
     pub fn consider_optimizing<T: Fn() -> String>(&self, msg: T) -> bool {
@@ -1333,7 +1330,7 @@ impl<'tcx> TyCtxt<'tcx> {
 
     pub fn serialize_query_result_cache<E>(self, encoder: &mut E) -> Result<(), E::Error>
     where
-        E: ty::codec::TyEncoder,
+        E: ty::codec::OpaqueEncoder,
     {
         self.queries.on_disk_cache.serialize(self, encoder)
     }
@@ -1380,7 +1377,9 @@ impl<'tcx> TyCtxt<'tcx> {
     /// we still evaluate them eagerly.
     #[inline]
     pub fn lazy_normalization(self) -> bool {
-        self.features().const_generics || self.features().lazy_normalization_consts
+        let features = self.features();
+        // Note: We do not enable lazy normalization for `features.min_const_generics`.
+        features.const_generics || features.lazy_normalization_consts
     }
 
     #[inline]
@@ -1418,7 +1417,7 @@ impl<'tcx> TyCtxt<'tcx> {
             _ => return None, // not a free region
         };
 
-        let hir_id = self.hir().as_local_hir_id(suitable_region_binding_scope);
+        let hir_id = self.hir().local_def_id_to_hir_id(suitable_region_binding_scope);
         let is_impl_item = match self.hir().find(hir_id) {
             Some(Node::Item(..) | Node::TraitItem(..)) => false,
             Some(Node::ImplItem(..)) => {
@@ -1439,7 +1438,7 @@ impl<'tcx> TyCtxt<'tcx> {
         &self,
         scope_def_id: LocalDefId,
     ) -> Vec<&'tcx hir::Ty<'tcx>> {
-        let hir_id = self.hir().as_local_hir_id(scope_def_id);
+        let hir_id = self.hir().local_def_id_to_hir_id(scope_def_id);
         let hir_output = match self.hir().get(hir_id) {
             Node::Item(hir::Item {
                 kind:
@@ -1484,7 +1483,7 @@ impl<'tcx> TyCtxt<'tcx> {
 
     pub fn return_type_impl_trait(&self, scope_def_id: LocalDefId) -> Option<(Ty<'tcx>, Span)> {
         // HACK: `type_of_def_id()` will fail on these (#55796), so return `None`.
-        let hir_id = self.hir().as_local_hir_id(scope_def_id);
+        let hir_id = self.hir().local_def_id_to_hir_id(scope_def_id);
         match self.hir().get(hir_id) {
             Node::Item(item) => {
                 match item.kind {
@@ -1539,7 +1538,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn caller_location_ty(&self) -> Ty<'tcx> {
         self.mk_imm_ref(
             self.lifetimes.re_static,
-            self.type_of(self.require_lang_item(PanicLocationLangItem, None))
+            self.type_of(self.require_lang_item(LangItem::PanicLocation, None))
                 .subst(*self, self.mk_substs([self.lifetimes.re_static.into()].iter())),
         )
     }
@@ -1632,7 +1631,6 @@ pub mod tls {
     use crate::ty::query;
     use rustc_data_structures::sync::{self, Lock};
     use rustc_data_structures::thin_vec::ThinVec;
-    use rustc_data_structures::OnDrop;
     use rustc_errors::Diagnostic;
     use std::mem;
 
@@ -1649,8 +1647,7 @@ pub mod tls {
     /// in this module.
     #[derive(Clone)]
     pub struct ImplicitCtxt<'a, 'tcx> {
-        /// The current `TyCtxt`. Initially created by `enter_global` and updated
-        /// by `enter_local` with a new local interner.
+        /// The current `TyCtxt`.
         pub tcx: TyCtxt<'tcx>,
 
         /// The current query job, if any. This is updated by `JobOwner::start` in
@@ -1669,6 +1666,13 @@ pub mod tls {
         pub task_deps: Option<&'a Lock<TaskDeps>>,
     }
 
+    impl<'a, 'tcx> ImplicitCtxt<'a, 'tcx> {
+        pub fn new(gcx: &'tcx GlobalCtxt<'tcx>) -> Self {
+            let tcx = TyCtxt { gcx };
+            ImplicitCtxt { tcx, query: None, diagnostics: None, layout_depth: 0, task_deps: None }
+        }
+    }
+
     /// Sets Rayon's thread-local variable, which is preserved for Rayon jobs
     /// to `value` during the call to `f`. It is restored to its previous value after.
     /// This is used to set the pointer to the new `ImplicitCtxt`.
@@ -1682,7 +1686,7 @@ pub mod tls {
     /// This is used to get the pointer to the current `ImplicitCtxt`.
     #[cfg(parallel_compiler)]
     #[inline]
-    fn get_tlv() -> usize {
+    pub fn get_tlv() -> usize {
         rayon_core::tlv::get()
     }
 
@@ -1699,7 +1703,7 @@ pub mod tls {
     #[inline]
     fn set_tlv<F: FnOnce() -> R, R>(value: usize, f: F) -> R {
         let old = get_tlv();
-        let _reset = OnDrop(move || TLV.with(|tlv| tlv.set(old)));
+        let _reset = rustc_data_structures::OnDrop(move || TLV.with(|tlv| tlv.set(old)));
         TLV.with(|tlv| tlv.set(value));
         f()
     }
@@ -1718,50 +1722,6 @@ pub mod tls {
         F: FnOnce(&ImplicitCtxt<'a, 'tcx>) -> R,
     {
         set_tlv(context as *const _ as usize, || f(&context))
-    }
-
-    /// Enters `GlobalCtxt` by setting up librustc_ast callbacks and
-    /// creating a initial `TyCtxt` and `ImplicitCtxt`.
-    /// This happens once per rustc session and `TyCtxt`s only exists
-    /// inside the `f` function.
-    pub fn enter_global<'tcx, F, R>(gcx: &'tcx GlobalCtxt<'tcx>, f: F) -> R
-    where
-        F: FnOnce(TyCtxt<'tcx>) -> R,
-    {
-        // Update `GCX_PTR` to indicate there's a `GlobalCtxt` available.
-        GCX_PTR.with(|lock| {
-            *lock.lock() = gcx as *const _ as usize;
-        });
-        // Set `GCX_PTR` back to 0 when we exit.
-        let _on_drop = OnDrop(move || {
-            GCX_PTR.with(|lock| *lock.lock() = 0);
-        });
-
-        let tcx = TyCtxt { gcx };
-        let icx =
-            ImplicitCtxt { tcx, query: None, diagnostics: None, layout_depth: 0, task_deps: None };
-        enter_context(&icx, |_| f(tcx))
-    }
-
-    scoped_thread_local! {
-        /// Stores a pointer to the `GlobalCtxt` if one is available.
-        /// This is used to access the `GlobalCtxt` in the deadlock handler given to Rayon.
-        pub static GCX_PTR: Lock<usize>
-    }
-
-    /// Creates a `TyCtxt` and `ImplicitCtxt` based on the `GCX_PTR` thread local.
-    /// This is used in the deadlock handler.
-    pub unsafe fn with_global<F, R>(f: F) -> R
-    where
-        F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> R,
-    {
-        let gcx = GCX_PTR.with(|lock| *lock.lock());
-        assert!(gcx != 0);
-        let gcx = &*(gcx as *const GlobalCtxt<'_>);
-        let tcx = TyCtxt { gcx };
-        let icx =
-            ImplicitCtxt { query: None, diagnostics: None, tcx, layout_depth: 0, task_deps: None };
-        enter_context(&icx, |_| f(tcx))
     }
 
     /// Allows access to the current `ImplicitCtxt` in a closure if one is available.
@@ -2225,12 +2185,12 @@ impl<'tcx> TyCtxt<'tcx> {
 
     #[inline]
     pub fn mk_box(self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        let def_id = self.require_lang_item(lang_items::OwnedBoxLangItem, None);
+        let def_id = self.require_lang_item(LangItem::OwnedBox, None);
         self.mk_generic_adt(def_id, ty)
     }
 
     #[inline]
-    pub fn mk_lang_item(self, ty: Ty<'tcx>, item: lang_items::LangItem) -> Option<Ty<'tcx>> {
+    pub fn mk_lang_item(self, ty: Ty<'tcx>, item: LangItem) -> Option<Ty<'tcx>> {
         let def_id = self.lang_items().require(item).ok()?;
         Some(self.mk_generic_adt(def_id, ty))
     }
@@ -2243,7 +2203,7 @@ impl<'tcx> TyCtxt<'tcx> {
 
     #[inline]
     pub fn mk_maybe_uninit(self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        let def_id = self.require_lang_item(lang_items::MaybeUninitLangItem, None);
+        let def_id = self.require_lang_item(LangItem::MaybeUninit, None);
         self.mk_generic_adt(def_id, ty)
     }
 
@@ -2652,6 +2612,21 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 }
 
+impl TyCtxtAt<'tcx> {
+    /// Constructs a `TyKind::Error` type and registers a `delay_span_bug` to ensure it gets used.
+    #[track_caller]
+    pub fn ty_error(self) -> Ty<'tcx> {
+        self.tcx.ty_error_with_message(self.span, "TyKind::Error constructed but no error reported")
+    }
+
+    /// Constructs a `TyKind::Error` type and registers a `delay_span_bug` with the given `msg to
+    /// ensure it gets used.
+    #[track_caller]
+    pub fn ty_error_with_message(self, msg: &str) -> Ty<'tcx> {
+        self.tcx.ty_error_with_message(self.span, msg)
+    }
+}
+
 pub trait InternAs<T: ?Sized, R> {
     type Output;
     fn intern_with<F>(self, f: F) -> Self::Output
@@ -2775,11 +2750,11 @@ pub fn provide(providers: &mut ty::query::Providers) {
     };
     providers.is_panic_runtime = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        attr::contains_name(tcx.hir().krate_attrs(), sym::panic_runtime)
+        tcx.sess.contains_name(tcx.hir().krate_attrs(), sym::panic_runtime)
     };
     providers.is_compiler_builtins = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        attr::contains_name(tcx.hir().krate_attrs(), sym::compiler_builtins)
+        tcx.sess.contains_name(tcx.hir().krate_attrs(), sym::compiler_builtins)
     };
     providers.has_panic_handler = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);

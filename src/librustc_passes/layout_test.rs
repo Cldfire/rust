@@ -1,4 +1,4 @@
-use rustc_ast::ast::Attribute;
+use rustc_ast::Attribute;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::itemlikevisit::ItemLikeVisitor;
@@ -29,7 +29,7 @@ impl ItemLikeVisitor<'tcx> for LayoutTest<'tcx> {
             | ItemKind::Struct(..)
             | ItemKind::Union(..) => {
                 for attr in self.tcx.get_attrs(item_def_id.to_def_id()).iter() {
-                    if attr.check_name(sym::rustc_layout) {
+                    if self.tcx.sess.check_name(attr, sym::rustc_layout) {
                         self.dump_layout_of(item_def_id, item, attr);
                     }
                 }

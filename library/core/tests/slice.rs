@@ -1358,15 +1358,15 @@ fn sort_unstable() {
     use core::slice::heapsort;
     use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
-    // Miri is too slow
-    let large_range = if cfg!(miri) { 0..0 } else { 500..510 };
+    // Miri is too slow (but still need to `chain` to make the types match)
+    let lens = if cfg!(miri) { (2..20).chain(0..0) } else { (2..25).chain(500..510) };
     let rounds = if cfg!(miri) { 1 } else { 100 };
 
     let mut v = [0; 600];
     let mut tmp = [0; 600];
     let mut rng = StdRng::from_entropy();
 
-    for len in (2..25).chain(large_range) {
+    for len in lens {
         let v = &mut v[0..len];
         let tmp = &mut tmp[0..len];
 
@@ -1630,7 +1630,6 @@ pub mod memchr {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)] // Miri does not compute a maximal `mid` for `align_offset`
 fn test_align_to_simple() {
     let bytes = [1u8, 2, 3, 4, 5, 6, 7];
     let (prefix, aligned, suffix) = unsafe { bytes.align_to::<u16>() };
@@ -1660,7 +1659,6 @@ fn test_align_to_zst() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)] // Miri does not compute a maximal `mid` for `align_offset`
 fn test_align_to_non_trivial() {
     #[repr(align(8))]
     struct U64(u64, u64);

@@ -20,13 +20,12 @@ pub use rustc_hir::def::{Namespace, PerNS};
 use Determinacy::*;
 
 use rustc_arena::TypedArena;
-use rustc_ast::ast::{self, FloatTy, IntTy, NodeId, UintTy};
-use rustc_ast::ast::{Crate, CRATE_NODE_ID};
-use rustc_ast::ast::{ItemKind, Path};
-use rustc_ast::attr;
 use rustc_ast::node_id::NodeMap;
 use rustc_ast::unwrap_or;
 use rustc_ast::visit::{self, Visitor};
+use rustc_ast::{self as ast, FloatTy, IntTy, NodeId, UintTy};
+use rustc_ast::{Crate, CRATE_NODE_ID};
+use rustc_ast::{ItemKind, Path};
 use rustc_ast_lowering::ResolverAstLowering;
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
@@ -44,9 +43,9 @@ use rustc_index::vec::IndexVec;
 use rustc_metadata::creader::{CStore, CrateLoader};
 use rustc_middle::hir::exports::ExportMap;
 use rustc_middle::middle::cstore::{CrateStore, MetadataLoaderDyn};
-use rustc_middle::span_bug;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, DefIdTree, ResolverOutputs};
+use rustc_middle::{bug, span_bug};
 use rustc_session::lint;
 use rustc_session::lint::{BuiltinLintDiagnostics, LintBuffer};
 use rustc_session::Session;
@@ -55,10 +54,11 @@ use rustc_span::source_map::Spanned;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 
-use log::debug;
+use smallvec::{smallvec, SmallVec};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::{cmp, fmt, iter, ptr};
+use tracing::debug;
 
 use diagnostics::{extend_span_to_previous_binding, find_span_of_binding_until_next_binding};
 use diagnostics::{ImportSuggestion, LabelSuggestion, Suggestion};
@@ -218,6 +218,10 @@ enum ResolutionError<'a> {
     ParamInTyOfConstParam(Symbol),
     /// constant values inside of type parameter defaults must not depend on generic parameters.
     ParamInAnonConstInTyDefault(Symbol),
+    /// generic parameters must not be used inside of non trivial constant values.
+    ///
+    /// This error is only emitted when using `min_const_generics`.
+    ParamInNonTrivialAnonConst(Symbol),
     /// Error E0735: type parameters with a default cannot use `Self`
     SelfInTyParamDefault,
     /// Error E0767: use of unreachable label
@@ -515,6 +519,29 @@ impl<'a> ModuleData<'a> {
             if let Some(binding) = name_resolution.borrow().binding {
                 f(resolver, key.ident, key.ns, binding);
             }
+        }
+    }
+
+    /// This modifies `self` in place. The traits will be stored in `self.traits`.
+    fn ensure_traits<R>(&'a self, resolver: &mut R)
+    where
+        R: AsMut<Resolver<'a>>,
+    {
+        let mut traits = self.traits.borrow_mut();
+        if traits.is_none() {
+            let mut collected_traits = Vec::new();
+            self.for_each_child(resolver, |_, name, ns, binding| {
+                if ns != TypeNS {
+                    return;
+                }
+                match binding.res() {
+                    Res::Def(DefKind::Trait | DefKind::TraitAlias, _) => {
+                        collected_traits.push((name, binding))
+                    }
+                    _ => (),
+                }
+            });
+            *traits = Some(collected_traits.into_boxed_slice());
         }
     }
 
@@ -1073,37 +1100,6 @@ impl ResolverAstLowering for Resolver<'_> {
         self.cstore().item_generics_num_lifetimes(def_id, sess)
     }
 
-    fn resolve_str_path(
-        &mut self,
-        span: Span,
-        crate_root: Option<Symbol>,
-        components: &[Symbol],
-        ns: Namespace,
-    ) -> (ast::Path, Res) {
-        let root = if crate_root.is_some() { kw::PathRoot } else { kw::Crate };
-        let segments = iter::once(Ident::with_dummy_span(root))
-            .chain(
-                crate_root
-                    .into_iter()
-                    .chain(components.iter().cloned())
-                    .map(Ident::with_dummy_span),
-            )
-            .map(|i| self.new_ast_path_segment(i))
-            .collect::<Vec<_>>();
-
-        let path = ast::Path { span, segments };
-
-        let parent_scope = &ParentScope::module(self.graph_root);
-        let res = match self.resolve_ast_path(&path, ns, parent_scope) {
-            Ok(res) => res,
-            Err((span, error)) => {
-                self.report_error(span, error);
-                Res::Err
-            }
-        };
-        (path, res)
-    }
-
     fn get_partial_res(&mut self, id: NodeId) -> Option<PartialRes> {
         self.partial_res_map.get(&id).cloned()
     }
@@ -1194,7 +1190,7 @@ impl<'a> Resolver<'a> {
         let root_def_id = DefId::local(CRATE_DEF_INDEX);
         let root_module_kind = ModuleKind::Def(DefKind::Mod, root_def_id, kw::Invalid);
         let graph_root = arenas.alloc_module(ModuleData {
-            no_implicit_prelude: attr::contains_name(&krate.attrs, sym::no_implicit_prelude),
+            no_implicit_prelude: session.contains_name(&krate.attrs, sym::no_implicit_prelude),
             ..ModuleData::new(None, root_module_kind, root_def_id, ExpnId::root(), krate.span)
         });
         let empty_module_kind = ModuleKind::Def(DefKind::Mod, root_def_id, kw::Invalid);
@@ -1232,9 +1228,9 @@ impl<'a> Resolver<'a> {
             .map(|(name, _)| (Ident::from_str(name), Default::default()))
             .collect();
 
-        if !attr::contains_name(&krate.attrs, sym::no_core) {
+        if !session.contains_name(&krate.attrs, sym::no_core) {
             extern_prelude.insert(Ident::with_dummy_span(sym::core), Default::default());
-            if !attr::contains_name(&krate.attrs, sym::no_std) {
+            if !session.contains_name(&krate.attrs, sym::no_std) {
                 extern_prelude.insert(Ident::with_dummy_span(sym::std), Default::default());
                 if session.rust_2018() {
                     extern_prelude.insert(Ident::with_dummy_span(sym::meta), Default::default());
@@ -1456,6 +1452,68 @@ impl<'a> Resolver<'a> {
         self.check_unused(krate);
         self.report_errors(krate);
         self.crate_loader.postprocess(krate);
+    }
+
+    fn get_traits_in_module_containing_item(
+        &mut self,
+        ident: Ident,
+        ns: Namespace,
+        module: Module<'a>,
+        found_traits: &mut Vec<TraitCandidate>,
+        parent_scope: &ParentScope<'a>,
+    ) {
+        assert!(ns == TypeNS || ns == ValueNS);
+        module.ensure_traits(self);
+        let traits = module.traits.borrow();
+
+        for &(trait_name, binding) in traits.as_ref().unwrap().iter() {
+            // Traits have pseudo-modules that can be used to search for the given ident.
+            if let Some(module) = binding.module() {
+                let mut ident = ident;
+                if ident.span.glob_adjust(module.expansion, binding.span).is_none() {
+                    continue;
+                }
+                if self
+                    .resolve_ident_in_module_unadjusted(
+                        ModuleOrUniformRoot::Module(module),
+                        ident,
+                        ns,
+                        parent_scope,
+                        false,
+                        module.span,
+                    )
+                    .is_ok()
+                {
+                    let import_ids = self.find_transitive_imports(&binding.kind, trait_name);
+                    let trait_def_id = module.def_id().unwrap();
+                    found_traits.push(TraitCandidate { def_id: trait_def_id, import_ids });
+                }
+            } else if let Res::Def(DefKind::TraitAlias, _) = binding.res() {
+                // For now, just treat all trait aliases as possible candidates, since we don't
+                // know if the ident is somewhere in the transitive bounds.
+                let import_ids = self.find_transitive_imports(&binding.kind, trait_name);
+                let trait_def_id = binding.res().def_id();
+                found_traits.push(TraitCandidate { def_id: trait_def_id, import_ids });
+            } else {
+                bug!("candidate is not trait or trait alias?")
+            }
+        }
+    }
+
+    fn find_transitive_imports(
+        &mut self,
+        mut kind: &NameBindingKind<'_>,
+        trait_name: Ident,
+    ) -> SmallVec<[LocalDefId; 1]> {
+        let mut import_ids = smallvec![];
+        while let NameBindingKind::Import { import, binding, .. } = kind {
+            let id = self.local_def_id(import.id);
+            self.maybe_unused_trait_imports.insert(id);
+            self.add_to_glob_map(&import, trait_name);
+            import_ids.push(id);
+            kind = &binding.kind;
+        }
+        import_ids
     }
 
     fn new_module(
@@ -2507,7 +2565,7 @@ impl<'a> Resolver<'a> {
                                 res_err = Some(CannotCaptureDynamicEnvironmentInFnItem);
                             }
                         }
-                        ConstantItemRibKind => {
+                        ConstantItemRibKind(_) => {
                             // Still doesn't deal with upvars
                             if record_used {
                                 self.report_error(span, AttemptToUseNonConstantValueInConstant);
@@ -2546,7 +2604,18 @@ impl<'a> Resolver<'a> {
                             in_ty_param_default = true;
                             continue;
                         }
-                        ConstantItemRibKind => {
+                        ConstantItemRibKind(trivial) => {
+                            // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
+                            if !trivial && self.session.features_untracked().min_const_generics {
+                                if record_used {
+                                    self.report_error(
+                                        span,
+                                        ResolutionError::ParamInNonTrivialAnonConst(rib_ident.name),
+                                    );
+                                }
+                                return Res::Err;
+                            }
+
                             if in_ty_param_default {
                                 if record_used {
                                     self.report_error(
@@ -2612,7 +2681,18 @@ impl<'a> Resolver<'a> {
                             in_ty_param_default = true;
                             continue;
                         }
-                        ConstantItemRibKind => {
+                        ConstantItemRibKind(trivial) => {
+                            // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
+                            if !trivial && self.session.features_untracked().min_const_generics {
+                                if record_used {
+                                    self.report_error(
+                                        span,
+                                        ResolutionError::ParamInNonTrivialAnonConst(rib_ident.name),
+                                    );
+                                }
+                                return Res::Err;
+                            }
+
                             if in_ty_param_default {
                                 if record_used {
                                     self.report_error(
@@ -3043,6 +3123,34 @@ impl<'a> Resolver<'a> {
                 )
             }
         })
+    }
+
+    /// This is equivalent to `get_traits_in_module_containing_item`, but without filtering by the associated item.
+    ///
+    /// This is used by rustdoc for intra-doc links.
+    pub fn traits_in_scope(&mut self, module_id: DefId) -> Vec<TraitCandidate> {
+        let module = self.get_module(module_id);
+        module.ensure_traits(self);
+        let traits = module.traits.borrow();
+        let to_candidate =
+            |this: &mut Self, &(trait_name, binding): &(Ident, &NameBinding<'_>)| TraitCandidate {
+                def_id: binding.res().def_id(),
+                import_ids: this.find_transitive_imports(&binding.kind, trait_name),
+            };
+
+        let mut candidates: Vec<_> =
+            traits.as_ref().unwrap().iter().map(|x| to_candidate(self, x)).collect();
+
+        if let Some(prelude) = self.prelude {
+            if !module.no_implicit_prelude {
+                prelude.ensure_traits(self);
+                candidates.extend(
+                    prelude.traits.borrow().as_ref().unwrap().iter().map(|x| to_candidate(self, x)),
+                );
+            }
+        }
+
+        candidates
     }
 
     /// Rustdoc uses this to resolve things in a recoverable way. `ResolutionError<'a>`

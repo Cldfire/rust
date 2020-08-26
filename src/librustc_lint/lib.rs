@@ -55,7 +55,7 @@ mod redundant_semicolon;
 mod types;
 mod unused;
 
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::query::Providers;
@@ -219,7 +219,7 @@ pub fn new_lint_store(no_interleave_lints: bool, internal_lints: bool) -> LintSt
 
 /// Tell the `LintStore` about all the built-in lints (the ones
 /// defined in this crate and the ones defined in
-/// `rustc::lint::builtin`).
+/// `rustc_session::lint::builtin`).
 fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
     macro_rules! add_lint_group {
         ($name:expr, $($lint:ident),*) => (

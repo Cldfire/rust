@@ -4,11 +4,11 @@ use crate::mir::{GeneratorLayout, GeneratorSavedLocal};
 use crate::ty::subst::Subst;
 use crate::ty::{self, subst::SubstsRef, ReprOptions, Ty, TyCtxt, TypeFoldable};
 
-use rustc_ast::ast::{self, IntTy, UintTy};
+use rustc_ast::{self as ast, IntTy, UintTy};
 use rustc_attr as attr;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir as hir;
-use rustc_hir::lang_items::{GeneratorStateLangItem, PinTypeLangItem};
+use rustc_hir::lang_items::LangItem;
 use rustc_index::bit_set::BitSet;
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_session::{DataTypeKind, FieldInfo, SizeKind, VariantInfo};
@@ -165,7 +165,7 @@ pub const FAT_PTR_ADDR: usize = 0;
 /// - For a slice, this is the length.
 pub const FAT_PTR_EXTRA: usize = 1;
 
-#[derive(Copy, Clone, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable)]
 pub enum LayoutError<'tcx> {
     Unknown(Ty<'tcx>),
     SizeOverflow(Ty<'tcx>),
@@ -876,6 +876,8 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
                     .iter_enumerated()
                     .all(|(i, v)| v.discr == ty::VariantDiscr::Relative(i.as_u32()));
 
+                let mut niche_filling_layout = None;
+
                 // Niche-filling enum optimization.
                 if !def.repr.inhibit_enum_layout_opt() && no_explicit_discriminants {
                     let mut dataful_variant = None;
@@ -972,7 +974,7 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
                             let largest_niche =
                                 Niche::from_scalar(dl, offset, niche_scalar.clone());
 
-                            return Ok(tcx.intern_layout(Layout {
+                            niche_filling_layout = Some(Layout {
                                 variants: Variants::Multiple {
                                     tag: niche_scalar,
                                     tag_encoding: TagEncoding::Niche {
@@ -991,7 +993,7 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
                                 largest_niche,
                                 size,
                                 align,
-                            }));
+                            });
                         }
                     }
                 }
@@ -1214,7 +1216,7 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
 
                 let largest_niche = Niche::from_scalar(dl, Size::ZERO, tag.clone());
 
-                tcx.intern_layout(Layout {
+                let tagged_layout = Layout {
                     variants: Variants::Multiple {
                         tag,
                         tag_encoding: TagEncoding::Direct,
@@ -1229,7 +1231,23 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
                     abi,
                     align,
                     size,
-                })
+                };
+
+                let best_layout = match (tagged_layout, niche_filling_layout) {
+                    (tagged_layout, Some(niche_filling_layout)) => {
+                        // Pick the smaller layout; otherwise,
+                        // pick the layout with the larger niche; otherwise,
+                        // pick tagged as it has simpler codegen.
+                        cmp::min_by_key(tagged_layout, niche_filling_layout, |layout| {
+                            let niche_size =
+                                layout.largest_niche.as_ref().map_or(0, |n| n.available(dl));
+                            (layout.size, cmp::Reverse(niche_size))
+                        })
+                    }
+                    (tagged_layout, None) => tagged_layout,
+                };
+
+                tcx.intern_layout(best_layout)
             }
 
             // Types with no meaningful known layout.
@@ -2353,13 +2371,13 @@ impl<'tcx> ty::Instance<'tcx> {
                 let env_region = ty::ReLateBound(ty::INNERMOST, ty::BrEnv);
                 let env_ty = tcx.mk_mut_ref(tcx.mk_region(env_region), ty);
 
-                let pin_did = tcx.require_lang_item(PinTypeLangItem, None);
+                let pin_did = tcx.require_lang_item(LangItem::Pin, None);
                 let pin_adt_ref = tcx.adt_def(pin_did);
                 let pin_substs = tcx.intern_substs(&[env_ty.into()]);
                 let env_ty = tcx.mk_adt(pin_adt_ref, pin_substs);
 
                 sig.map_bound(|sig| {
-                    let state_did = tcx.require_lang_item(GeneratorStateLangItem, None);
+                    let state_did = tcx.require_lang_item(LangItem::GeneratorState, None);
                     let state_adt_ref = tcx.adt_def(state_did);
                     let state_substs =
                         tcx.intern_substs(&[sig.yield_ty.into(), sig.return_ty.into()]);

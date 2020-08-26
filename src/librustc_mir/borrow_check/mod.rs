@@ -106,7 +106,7 @@ fn mir_borrowck<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: ty::WithOptConstParam<LocalDefId>,
 ) -> &'tcx BorrowCheckResult<'tcx> {
-    let (input_body, promoted) = tcx.mir_validated(def);
+    let (input_body, promoted) = tcx.mir_promoted(def);
     debug!("run query mir_borrowck: {}", tcx.def_path_str(def.did.to_def_id()));
 
     let opt_closure_req = tcx.infer_ctxt().enter(|infcx| {
@@ -129,7 +129,7 @@ fn do_mir_borrowck<'a, 'tcx>(
 
     let tcx = infcx.tcx;
     let param_env = tcx.param_env(def.did);
-    let id = tcx.hir().as_local_hir_id(def.did);
+    let id = tcx.hir().local_def_id_to_hir_id(def.did);
 
     let mut local_names = IndexVec::from_elem(None, &input_body.local_decls);
     for var_debug_info in &input_body.var_debug_info {
@@ -644,6 +644,7 @@ impl<'cx, 'tcx> dataflow::ResultsVisitor<'cx, 'tcx> for MirBorrowckCtxt<'cx, 'tc
                 }
             }
             StatementKind::Nop
+            | StatementKind::Coverage(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::Retag { .. }
             | StatementKind::StorageLive(..) => {
@@ -1131,11 +1132,8 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                 (
                     Reservation(WriteKind::MutableBorrow(bk)),
                     BorrowKind::Shallow | BorrowKind::Shared,
-                ) if {
-                    tcx.migrate_borrowck() && this.borrow_set.location_map.contains_key(&location)
-                } =>
-                {
-                    let bi = this.borrow_set.location_map[&location];
+                ) if { tcx.migrate_borrowck() && this.borrow_set.contains(&location) } => {
+                    let bi = this.borrow_set.get_index_of(&location).unwrap();
                     debug!(
                         "recording invalid reservation of place: {:?} with \
                          borrow index {:?} as warning",

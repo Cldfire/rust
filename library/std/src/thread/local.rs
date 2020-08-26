@@ -71,9 +71,7 @@ use crate::fmt;
 ///    not guard typically have a synthetic limit after which point no more
 ///    destructors are run.
 ///
-/// [`with`]: ../../std/thread/struct.LocalKey.html#method.with
-/// [`thread_local!`]: ../../std/macro.thread_local.html
-/// [`Drop`]: ../../std/ops/trait.Drop.html
+/// [`with`]: LocalKey::with
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct LocalKey<T: 'static> {
     // This outer `LocalKey<T>` type is what's going to be stored in statics,
@@ -118,10 +116,10 @@ impl<T: 'static> fmt::Debug for LocalKey<T> {
 /// # fn main() {}
 /// ```
 ///
-/// See [LocalKey documentation][`std::thread::LocalKey`] for more
+/// See [`LocalKey` documentation][`std::thread::LocalKey`] for more
 /// information.
 ///
-/// [`std::thread::LocalKey`]: ../std/thread/struct.LocalKey.html
+/// [`std::thread::LocalKey`]: crate::thread::LocalKey
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[allow_internal_unstable(thread_local_internals)]
@@ -172,7 +170,11 @@ macro_rules! __thread_local_inner {
                 static __KEY: $crate::thread::__OsLocalKeyInner<$t> =
                     $crate::thread::__OsLocalKeyInner::new();
 
-                __KEY.get(__init)
+                // FIXME: remove the #[allow(...)] marker when macros don't
+                // raise warning for missing/extraneous unsafe blocks anymore.
+                // See https://github.com/rust-lang/rust/issues/74838.
+                #[allow(unused_unsafe)]
+                unsafe { __KEY.get(__init) }
             }
 
             unsafe {

@@ -69,16 +69,17 @@ This API is completely unstable and subject to change.
 #![recursion_limit = "256"]
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 #[macro_use]
 extern crate rustc_middle;
 
-// This is used by Clippy.
+// These are used by Clippy.
+pub mod check;
 pub mod expr_use_visitor;
 
 mod astconv;
-mod check;
+mod bounds;
 mod check_unused;
 mod coherence;
 mod collect;
@@ -100,7 +101,7 @@ use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::util;
 use rustc_session::config::EntryFnType;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{symbol::sym, Span, DUMMY_SP};
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits::error_reporting::InferCtxtExt as _;
 use rustc_trait_selection::traits::{
@@ -109,7 +110,8 @@ use rustc_trait_selection::traits::{
 
 use std::iter;
 
-use astconv::{AstConv, Bounds};
+use astconv::AstConv;
+use bounds::Bounds;
 
 fn require_c_abi_if_c_variadic(tcx: TyCtxt<'_>, decl: &hir::FnDecl<'_>, abi: Abi, span: Span) {
     if decl.c_variadic && !(abi == Abi::C || abi == Abi::Cdecl) {
@@ -153,7 +155,7 @@ fn require_same_types<'tcx>(
 }
 
 fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: LocalDefId) {
-    let main_id = tcx.hir().as_local_hir_id(main_def_id);
+    let main_id = tcx.hir().local_def_id_to_hir_id(main_def_id);
     let main_span = tcx.def_span(main_def_id);
     let main_t = tcx.type_of(main_def_id);
     match main_t.kind {
@@ -194,6 +196,23 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: LocalDefId) {
                         .emit();
                         error = true;
                     }
+
+                    for attr in it.attrs {
+                        if tcx.sess.check_name(attr, sym::track_caller) {
+                            tcx.sess
+                                .struct_span_err(
+                                    attr.span,
+                                    "`main` function is not allowed to be `#[track_caller]`",
+                                )
+                                .span_label(
+                                    main_span,
+                                    "`main` function is not allowed to be `#[track_caller]`",
+                                )
+                                .emit();
+                            error = true;
+                        }
+                    }
+
                     if error {
                         return;
                     }
@@ -232,7 +251,7 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: LocalDefId) {
 }
 
 fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: LocalDefId) {
-    let start_id = tcx.hir().as_local_hir_id(start_def_id);
+    let start_id = tcx.hir().local_def_id_to_hir_id(start_def_id);
     let start_span = tcx.def_span(start_def_id);
     let start_t = tcx.type_of(start_def_id);
     match start_t.kind {
@@ -268,12 +287,29 @@ fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: LocalDefId) {
                             tcx.sess,
                             span,
                             E0752,
-                            "start is not allowed to be `async`"
+                            "`start` is not allowed to be `async`"
                         )
-                        .span_label(span, "start is not allowed to be `async`")
+                        .span_label(span, "`start` is not allowed to be `async`")
                         .emit();
                         error = true;
                     }
+
+                    for attr in it.attrs {
+                        if tcx.sess.check_name(attr, sym::track_caller) {
+                            tcx.sess
+                                .struct_span_err(
+                                    attr.span,
+                                    "`start` is not allowed to be `#[track_caller]`",
+                                )
+                                .span_label(
+                                    start_span,
+                                    "`start` is not allowed to be `#[track_caller]`",
+                                )
+                                .emit();
+                            error = true;
+                        }
+                    }
+
                     if error {
                         return;
                     }
@@ -356,6 +392,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
         tcx.sess.time("wf_checking", || check::check_wf_new(tcx));
     })?;
 
+    // NOTE: This is copy/pasted in librustdoc/core.rs and should be kept in sync.
     tcx.sess.time("item_types_checking", || {
         for &module in tcx.hir().krate().modules.keys() {
             tcx.ensure().check_mod_item_types(tcx.hir().local_def_id(module));
